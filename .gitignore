@@ -1,0 +1,13 @@
+.DS_store
+*.exe
+*.log
+*.csv
+*.pdf
+*.txt
+*.json
+*.yaml
+*.yml
+*.xml
+*.html
+*.css
+*.js
