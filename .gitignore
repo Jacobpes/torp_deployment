@@ -11,3 +11,14 @@
 *.html
 *.css
 *.js
+__pycache__/
+*.pyc
+build/
+dist/
+torp_deployment/
+*.xls
+*.xlsx
+*.zip
+id_ed25519
+id_ed25519.pub
+*.ipynb_checkpoints
