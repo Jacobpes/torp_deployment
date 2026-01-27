@@ -31,6 +31,8 @@ a = Analysis(
         'cryptography.hazmat',
         'cryptography.hazmat.primitives',
         'cryptography.hazmat.backends',
+        'openpyxl',
+        'openpyxl.utils',
     ],
     hookspath=[],
     hooksconfig={},

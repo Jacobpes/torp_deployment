@@ -24,6 +24,13 @@ import re
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+try:
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("Warning: openpyxl not available. Excel export will be skipped.")
 
 # Hitta projektets rot-katalog (en nivå upp från scripts/ om scriptet är i scripts/)
 # When running as executable, use sys.executable to find where .exe is located
@@ -40,7 +47,7 @@ else:
 # Konfiguration - använd absoluta sökvägar
 # When running as executable, use organized folder structure
 if getattr(sys, 'frozen', False):
-    OUTPUT_DIR = PROJECT_ROOT / 'output'  # Save in output subdirectory
+    OUTPUT_DIR = PROJECT_ROOT / 'output' / 'orderlistor'  # Save in output/orderlistor subdirectory
     DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'  # Downloads in data/nedladdningar
     BESTALLNINGSFREKVENS_PATH = PROJECT_ROOT / 'data' / 'parametrar' / 'Beställningsfrekvens.csv'
 else:
@@ -717,13 +724,44 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
         available_columns = [col for col in column_order if col in aggregated.columns]
         aggregated = aggregated[available_columns]
         
+        # Formatera data
+        # Prognosticerad_försäljning och beställningsbehov ska ha 1 decimal
+        if 'Prognosticerad_försäljning' in aggregated.columns:
+            aggregated['Prognosticerad_försäljning'] = aggregated['Prognosticerad_försäljning'].round(1)
+        if 'beställningsbehov' in aggregated.columns:
+            aggregated['beställningsbehov'] = aggregated['beställningsbehov'].round(1)
+        # Saldo och stock_warning_limit kan också ha 1 decimal för konsistens
+        if 'Saldo' in aggregated.columns:
+            aggregated['Saldo'] = aggregated['Saldo'].round(1)
+        if 'stock_warning_limit' in aggregated.columns:
+            aggregated['stock_warning_limit'] = aggregated['stock_warning_limit'].round(1)
+        
         # Spara till CSV
         safe_supplier_name = supplier_name.replace('/', '_').replace('\\', '_').replace(':', '_')
-        output_file = OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.csv'
-        aggregated.to_csv(str(output_file), index=False, sep=';', encoding='utf-8-sig')
+        output_file_csv = OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.csv'
+        aggregated.to_csv(str(output_file_csv), index=False, sep=';', encoding='utf-8-sig')
         
-        print(f"  ✓ Sparade orderlista med {len(aggregated)} produkter till {output_file}")
-        print(f"    Totalt beställningsbehov: {aggregated['beställningsbehov'].sum():.2f} enheter")
+        # Spara till Excel med auto-anpassade kolumnbredder
+        if OPENPYXL_AVAILABLE:
+            output_file_xlsx = OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.xlsx'
+            with pd.ExcelWriter(str(output_file_xlsx), engine='openpyxl') as writer:
+                aggregated.to_excel(writer, sheet_name='Orderlista', index=False)
+                worksheet = writer.sheets['Orderlista']
+                
+                # Auto-anpassa kolumnbredder
+                for idx, col in enumerate(aggregated.columns, 1):
+                    max_length = max(
+                        aggregated[col].astype(str).map(len).max(),
+                        len(str(col))
+                    )
+                    # Sätt en max-bredd för att undvika för breda kolumner
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
+        
+        print(f"  [OK] Sparade orderlista med {len(aggregated)} produkter till {output_file_csv}")
+        if OPENPYXL_AVAILABLE:
+            print(f"  [OK] Sparade Excel-fil: {output_file_xlsx}")
+        print(f"    Totalt beställningsbehov: {aggregated['beställningsbehov'].sum():.1f} enheter")
 
 def main():
     """Huvudfunktion"""

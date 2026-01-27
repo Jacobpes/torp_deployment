@@ -18,6 +18,13 @@ import re
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+try:
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    print("Warning: openpyxl not available. Excel export will be skipped.")
 
 # Hitta projektets rot-katalog (en nivå upp från scripts/ om scriptet är i scripts/)
 # When running as executable, use sys.executable to find where .exe is located
@@ -34,10 +41,10 @@ else:
 # Konfiguration - använd absoluta sökvägar
 # When running as executable, use organized folder structure
 if getattr(sys, 'frozen', False):
-    OUTPUT_DIR = PROJECT_ROOT / 'output'  # Save in output subdirectory
+    OUTPUT_DIR = PROJECT_ROOT / 'output' / 'plocklistor'  # Save in output/plocklistor subdirectory
     DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'  # Downloads in data/nedladdningar
     LEVERANSFREKVENS_PATH = PROJECT_ROOT / 'data' / 'parametrar' / 'Leveransfrekvens.csv'
-    PICKING_LIST_RESULTS_PATH = PROJECT_ROOT / 'output' / 'picking_list_results.csv'
+    PICKING_LIST_RESULTS_PATH = PROJECT_ROOT / 'output' / 'plocklistor' / 'picking_list_results.csv'
 else:
     OUTPUT_DIR = PROJECT_ROOT / 'plocklistor'
     DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'
@@ -542,11 +549,22 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
             unit = get_product_unit(product_name, store_name, unit_mapping)
             
             # Lägg till resultat
+            # Formatera Produktkod som sträng (inte float)
+            product_code = matched_stock['product_code']
+            if pd.notna(product_code):
+                # Konvertera till int om det är ett nummer, annars behåll som sträng
+                try:
+                    product_code = str(int(float(product_code)))
+                except (ValueError, TypeError):
+                    product_code = str(product_code)
+            else:
+                product_code = ''
+            
             result = {
                 'store_name': store_name,  # Lägg till butiksnamn för script 4
                 'Produktnamn': matched_stock['product_name'],
-                'Produktkod': matched_stock['product_code'] if pd.notna(matched_stock['product_code']) else '',
-                'Produkt_ID': matched_stock['product_id'],
+                'Produktkod': product_code,
+                'Produkt_ID': int(matched_stock['product_id']) if pd.notna(matched_stock['product_id']) else 0,
                 'Leveransfrekvens_dagar': delivery_frequency,
                 'saldo_denna_butik': current_stock,
                 'Varningsgräns': stock_warning_limit,
@@ -582,13 +600,60 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
             available_columns = [col for col in column_order if col in store_df.columns]
             store_df = store_df[available_columns]
             
+            # Formatera data
+            # Produkt_ID ska vara heltal (inte float)
+            if 'Produkt_ID' in store_df.columns:
+                store_df['Produkt_ID'] = store_df['Produkt_ID'].fillna(0).astype(int)
+            
+            # Produktkod ska vara sträng (inte float)
+            if 'Produktkod' in store_df.columns:
+                def format_product_code(val):
+                    if pd.isna(val) or val == '':
+                        return ''
+                    try:
+                        # Konvertera till int om möjligt, annars behåll som sträng
+                        return str(int(float(val)))
+                    except (ValueError, TypeError):
+                        return str(val)
+                store_df['Produktkod'] = store_df['Produktkod'].apply(format_product_code)
+            
+            # Prognosticerad_försäljning och Påfyllningsbehov ska ha 1 decimal
+            if 'Prognosticerad_försäljning' in store_df.columns:
+                store_df['Prognosticerad_försäljning'] = store_df['Prognosticerad_försäljning'].round(1)
+            if 'Påfyllningsbehov' in store_df.columns:
+                store_df['Påfyllningsbehov'] = store_df['Påfyllningsbehov'].round(1)
+            # Saldo och Varningsgräns kan också ha 1 decimal för konsistens
+            if 'saldo_denna_butik' in store_df.columns:
+                store_df['saldo_denna_butik'] = store_df['saldo_denna_butik'].round(1)
+            if 'Varningsgräns' in store_df.columns:
+                store_df['Varningsgräns'] = store_df['Varningsgräns'].round(1)
+            
             # Spara till CSV
             safe_store_name = store_name.replace('/', '_').replace('\\', '_').replace(':', '_')
-            output_file = OUTPUT_DIR / f'{safe_store_name}.csv'
-            store_df.to_csv(str(output_file), index=False, sep=';', encoding='utf-8-sig')
+            output_file_csv = OUTPUT_DIR / f'{safe_store_name}.csv'
+            store_df.to_csv(str(output_file_csv), index=False, sep=';', encoding='utf-8-sig')
             
-            print(f"  ✓ Sparade plocklista med {len(store_df)} produkter till {output_file}")
-            print(f"    Totalt påfyllningsbehov: {store_df['Påfyllningsbehov'].sum():.2f} enheter")
+            # Spara till Excel med auto-anpassade kolumnbredder
+            if OPENPYXL_AVAILABLE:
+                output_file_xlsx = OUTPUT_DIR / f'{safe_store_name}.xlsx'
+                with pd.ExcelWriter(str(output_file_xlsx), engine='openpyxl') as writer:
+                    store_df.to_excel(writer, sheet_name='Plocklista', index=False)
+                    worksheet = writer.sheets['Plocklista']
+                    
+                    # Auto-anpassa kolumnbredder
+                    for idx, col in enumerate(store_df.columns, 1):
+                        max_length = max(
+                            store_df[col].astype(str).map(len).max(),
+                            len(str(col))
+                        )
+                        # Sätt en max-bredd för att undvika för breda kolumner
+                        adjusted_width = min(max_length + 2, 50)
+                        worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
+            
+            print(f"  [OK] Sparade plocklista med {len(store_df)} produkter till {output_file_csv}")
+            if OPENPYXL_AVAILABLE:
+                print(f"  [OK] Sparade Excel-fil: {output_file_xlsx}")
+            print(f"    Totalt påfyllningsbehov: {store_df['Påfyllningsbehov'].sum():.1f} enheter")
         
         all_results.extend(store_results)
     
@@ -649,11 +714,55 @@ def main():
     if len(results) > 0:
         results_df = pd.DataFrame(results)
         print(f"Totalt antal produkter i alla plocklistor: {len(results_df)}")
-        print(f"Totalt antal enheter att fylla på: {results_df['Påfyllningsbehov'].sum():.2f}")
+        print(f"Totalt antal enheter att fylla på: {results_df['Påfyllningsbehov'].sum():.1f}")
+        
+        # Formatera data
+        # Produkt_ID ska vara heltal (inte float)
+        if 'Produkt_ID' in results_df.columns:
+            results_df['Produkt_ID'] = results_df['Produkt_ID'].fillna(0).astype(int)
+        
+        # Produktkod ska vara sträng (inte float)
+        if 'Produktkod' in results_df.columns:
+            def format_product_code(val):
+                if pd.isna(val) or val == '':
+                    return ''
+                try:
+                    return str(int(float(val)))
+                except (ValueError, TypeError):
+                    return str(val)
+            results_df['Produktkod'] = results_df['Produktkod'].apply(format_product_code)
+        
+        # Prognosticerad_försäljning och Påfyllningsbehov ska ha 1 decimal
+        if 'Prognosticerad_försäljning' in results_df.columns:
+            results_df['Prognosticerad_försäljning'] = results_df['Prognosticerad_försäljning'].round(1)
+        if 'Påfyllningsbehov' in results_df.columns:
+            results_df['Påfyllningsbehov'] = results_df['Påfyllningsbehov'].round(1)
+        # Saldo och Varningsgräns kan också ha 1 decimal för konsistens
+        if 'saldo_denna_butik' in results_df.columns:
+            results_df['saldo_denna_butik'] = results_df['saldo_denna_butik'].round(1)
+        if 'Varningsgräns' in results_df.columns:
+            results_df['Varningsgräns'] = results_df['Varningsgräns'].round(1)
         
         # Spara sammanfattande CSV-fil för script 4
         results_df.to_csv(str(PICKING_LIST_RESULTS_PATH), index=False, sep=';', encoding='utf-8-sig')
-        print(f"\n✓ Sparade sammanfattande plocklista till: {PICKING_LIST_RESULTS_PATH}")
+        print(f"\n[OK] Sparade sammanfattande plocklista till: {PICKING_LIST_RESULTS_PATH}")
+        
+        # Spara även som Excel
+        if OPENPYXL_AVAILABLE:
+            excel_path = PICKING_LIST_RESULTS_PATH.with_suffix('.xlsx')
+            with pd.ExcelWriter(str(excel_path), engine='openpyxl') as writer:
+                results_df.to_excel(writer, sheet_name='Plocklistor', index=False)
+                worksheet = writer.sheets['Plocklistor']
+                
+                # Auto-anpassa kolumnbredder
+                for idx, col in enumerate(results_df.columns, 1):
+                    max_length = max(
+                        results_df[col].astype(str).map(len).max(),
+                        len(str(col))
+                    )
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
+            print(f"[OK] Sparade Excel-fil: {excel_path}")
         
         # Räkna antal butiker
         stores_processed = sales_df['store'].nunique()

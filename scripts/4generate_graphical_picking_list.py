@@ -41,8 +41,8 @@ else:
 # Konfiguration - använd absoluta sökvägar
 # When running as executable, use organized folder structure
 if getattr(sys, 'frozen', False):
-    PICKING_LIST_PATH = PROJECT_ROOT / 'output' / 'picking_list_results.csv'
-    OUTPUT_DIR = PROJECT_ROOT / 'output'  # Save in output subdirectory
+    PICKING_LIST_PATH = PROJECT_ROOT / 'output' / 'plocklistor' / 'picking_list_results.csv'
+    OUTPUT_DIR = PROJECT_ROOT / 'output' / 'plocklistor'  # Save in output/plocklistor subdirectory
     DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'  # Downloads in data/nedladdningar
     LEVERANSFREKVENS_PATH = PROJECT_ROOT / 'data' / 'parametrar' / 'Leveransfrekvens.csv'
 else:
