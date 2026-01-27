@@ -301,7 +301,11 @@ def main():
     
     # Keep window open on Windows if running as executable
     if sys.platform == 'win32' and getattr(sys, 'frozen', False):
-        input("\nPress Enter to exit...")
+        try:
+            input("\nPress Enter to exit...")
+        except (EOFError, KeyboardInterrupt):
+            # Ignore if running non-interactively
+            pass
     
     return True
 
@@ -323,7 +327,11 @@ if __name__ == "__main__":
         main_logger.error(tb_str)
         error_logger.error(tb_str)
         if sys.platform == 'win32' and getattr(sys, 'frozen', False):
-            input("\nPress Enter to exit...")
+            try:
+                input("\nPress Enter to exit...")
+            except (EOFError, KeyboardInterrupt):
+                # Ignore if running non-interactively
+                pass
         sys.exit(1)
 
 

@@ -664,9 +664,18 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
         # Filtrera produkter för denna butik
         store_products = picking_list_df[picking_list_df['store_name'] == store_name].copy()
         
+        # Beräkna needs_refill baserat på Påfyllningsbehov > 0
+        if 'Påfyllningsbehov' in store_products.columns:
+            store_products['needs_refill'] = store_products['Påfyllningsbehov'] > 0
+        else:
+            store_products['needs_refill'] = False
+        
         # Sortera efter behov av påfyllning (först de som behöver mest)
-        store_products = store_products.sort_values(['needs_refill', 'fill_up_quantity'], 
-                                                    ascending=[False, False])
+        # Använd Påfyllningsbehov istället för fill_up_quantity
+        sort_cols = ['needs_refill']
+        if 'Påfyllningsbehov' in store_products.columns:
+            sort_cols.append('Påfyllningsbehov')
+        store_products = store_products.sort_values(sort_cols, ascending=[False, False])
         
         # Skapa PDF-filnamn (ersätt specialtecken)
         safe_store_name = store_name.replace('/', '_').replace('\\', '_')
@@ -678,10 +687,13 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
         # Skapa PDF med matplotlib
         with PdfPages(str(pdf_filename)) as pdf:
             for idx, (_, product_row) in enumerate(store_products.iterrows(), 1):
-                print(f"    Sidan {idx}/{len(store_products)}: {product_row['product_name'][:50]}...")
+                # Använd rätt kolumnnamn för produktnamn
+                product_name_col = 'Produktnamn' if 'Produktnamn' in product_row.index else 'product_name'
+                product_name_display = str(product_row[product_name_col])[:50] if product_name_col in product_row.index else 'Okänt produkt'
+                print(f"    Sidan {idx}/{len(store_products)}: {product_name_display}...")
                 
                 # Hämta försäljningshistorik för denna produkt
-                product_name_in_picking = product_row['product_name']
+                product_name_in_picking = product_row[product_name_col] if product_name_col in product_row.index else product_row.get('product_name', '')
                 
                 # Försök hitta matchande produktnamn i sales data
                 store_sales = sales_df[sales_df['store'] == store_name].copy()
@@ -748,12 +760,41 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                 # Skapa figur för denna produkt
                 fig = plt.figure(figsize=(11.69, 8.27))  # A4-landskap
                 
-                # Konvertera product_row till dict för enkelhet
+                # Konvertera product_row till dict och mappa kolumnnamn
                 product_info = product_row.to_dict()
                 
+                # Mappa kolumnnamn från CSV till förväntade namn i create_product_page
+                # CSV har: Produktnamn, Produktkod, saldo_denna_butik, Varningsgräns, Prognosticerad_försäljning, Påfyllningsbehov
+                # create_product_page förväntar: product_name, product_code, current_stock, stock_warning_limit, predicted_sales_units, fill_up_quantity, needs_refill, expected_stock_after_sales
+                
+                # Mappa kolumner
+                if 'Produktnamn' in product_info:
+                    product_info['product_name'] = product_info['Produktnamn']
+                if 'Produktkod' in product_info:
+                    product_info['product_code'] = product_info['Produktkod']
+                if 'saldo_denna_butik' in product_info:
+                    product_info['current_stock'] = product_info['saldo_denna_butik']
+                if 'Varningsgräns' in product_info:
+                    product_info['stock_warning_limit'] = product_info['Varningsgräns']
+                if 'Prognosticerad_försäljning' in product_info:
+                    product_info['predicted_sales_units'] = product_info['Prognosticerad_försäljning']
+                if 'Påfyllningsbehov' in product_info:
+                    product_info['fill_up_quantity'] = product_info['Påfyllningsbehov']
+                    product_info['needs_refill'] = product_info['Påfyllningsbehov'] > 0
+                else:
+                    product_info['fill_up_quantity'] = 0
+                    product_info['needs_refill'] = False
+                
+                # Beräkna expected_stock_after_sales om det saknas
+                if 'expected_stock_after_sales' not in product_info:
+                    current_stock = product_info.get('current_stock', 0)
+                    predicted_sales = product_info.get('predicted_sales_units', 0)
+                    product_info['expected_stock_after_sales'] = max(0, current_stock - predicted_sales)
+                
                 # Skapa sidan
+                predicted_sales_value = product_info.get('predicted_sales_units', 0)
                 create_product_page(fig, sales_history, product_info, 
-                                  product_info['predicted_sales_units'], weekly_forecast, unit=unit)
+                                  predicted_sales_value, weekly_forecast, unit=unit)
                 
                 # Lägg till sidan i PDF
                 pdf.savefig(fig, bbox_inches='tight')
