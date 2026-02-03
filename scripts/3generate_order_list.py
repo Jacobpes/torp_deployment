@@ -340,6 +340,73 @@ def load_stock_data(file_path):
     
     return stock_df
 
+
+def build_stock_index(stock_df):
+    """Bygger uppslag per butik för produkter i stock_report."""
+    stock_by_store = {}
+    if stock_df is None or len(stock_df) == 0:
+        return stock_by_store
+    for store_name, group in stock_df.groupby('store_name'):
+        stock_by_store[store_name] = (
+            group['product_name_normalized']
+            .dropna()
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .tolist()
+        )
+    return stock_by_store
+
+
+def product_exists_in_stock(product_name, store_name, stock_by_store):
+    """Returnerar True om produkten finns i stock_report för given butik."""
+    if store_name not in stock_by_store:
+        return False
+    product_norm = str(product_name).strip().lower()
+    stock_names = stock_by_store[store_name]
+    if product_norm in stock_names:
+        return True
+    # Partiell matchning för att hantera små namnvariationer
+    for stock_name in stock_names:
+        if product_norm in stock_name or stock_name in product_norm:
+            return True
+    return False
+
+
+def filter_sales_to_stock(sales_df, stock_df):
+    """
+    Filtrerar bort produkter som inte finns i stock_report.
+    Produkter som saknas i stock_report betraktas som utgångna.
+    """
+    stock_by_store = build_stock_index(stock_df)
+    if not stock_by_store:
+        return sales_df
+    allowed_pairs = set()
+    unique_pairs = sales_df[['store', 'name']].drop_duplicates()
+    for store_name, product_name in unique_pairs.itertuples(index=False):
+        if product_exists_in_stock(product_name, store_name, stock_by_store):
+            allowed_pairs.add((store_name, product_name))
+    if not allowed_pairs:
+        return sales_df.iloc[0:0].copy()
+    mask = [(s, n) in allowed_pairs for s, n in zip(sales_df['store'], sales_df['name'])]
+    filtered_df = sales_df[mask].copy()
+    removed = len(sales_df) - len(filtered_df)
+    if removed > 0:
+        print(f"  Filtrerade bort {removed} rader (produkter ej i stock_report)")
+    return filtered_df
+
+
+def filter_mapping_to_stock(mapping, stock_df):
+    """Filtrerar mapping till produkter som finns i stock_report."""
+    stock_by_store = build_stock_index(stock_df)
+    if not stock_by_store:
+        return mapping
+    filtered = {}
+    for (product_name, store_name), value in mapping.items():
+        if product_exists_in_stock(product_name, store_name, stock_by_store):
+            filtered[(product_name, store_name)] = value
+    return filtered
+
 def predict_product_sales(product_df, forecast_days):
     """
     Prognostiserar försäljning för en produkt baserat på historisk data.
@@ -790,6 +857,11 @@ def main():
     # Ladda försäljnings- och lagerdata
     sales_df = load_and_prepare_sales_data(latest_sales_file)
     stock_df = load_stock_data(latest_stock_file)
+
+    # Filtrera bort produkter som inte finns i stock_report
+    sales_df = filter_sales_to_stock(sales_df, stock_df)
+    supplier_mapping = filter_mapping_to_stock(supplier_mapping, stock_df)
+    unit_mapping = filter_mapping_to_stock(unit_mapping, stock_df)
     
     # Processa leverantörer och skapa orderlistor
     process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestallningsfrekvenser)

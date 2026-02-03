@@ -409,6 +409,52 @@ def predict_weekly_sales(product_df, future_weeks=4):
     
     return weekly_predictions
 
+def build_weekly_forecast_from_predicted_sales(predicted_sales_units, delivery_frequency_days, future_weeks=4):
+    """
+    Skapar en veckovis prognos baserat på plocklistans prognosvärde.
+    predicted_sales_units är total prognos för delivery_frequency_days dagar.
+    """
+    try:
+        if pd.isna(predicted_sales_units):
+            return pd.DataFrame(columns=['week_start', 'quantity', 'week_number', 'year', 'week_year'])
+        predicted_sales_units = float(predicted_sales_units)
+    except (TypeError, ValueError):
+        return pd.DataFrame(columns=['week_start', 'quantity', 'week_number', 'year', 'week_year'])
+    
+    try:
+        delivery_frequency_days = float(delivery_frequency_days)
+    except (TypeError, ValueError):
+        delivery_frequency_days = 7.0
+    
+    if delivery_frequency_days <= 0:
+        delivery_frequency_days = 7.0
+    
+    # Konvertera prognos för leveransperioden till veckovärde
+    weekly_value = predicted_sales_units * (7.0 / delivery_frequency_days)
+    
+    forecast_df = pd.DataFrame(columns=['week_start', 'quantity', 'week_number', 'year', 'week_year'])
+    today = pd.Timestamp.now().normalize()
+    tomorrow = today + pd.Timedelta(days=1)
+    days_until_monday = (7 - tomorrow.weekday()) % 7
+    if days_until_monday == 0:
+        first_future_monday = tomorrow
+    else:
+        first_future_monday = tomorrow + pd.Timedelta(days=days_until_monday)
+    
+    for week_num in range(future_weeks):
+        week_start = first_future_monday + pd.Timedelta(weeks=week_num)
+        iso_week = week_start.isocalendar().week
+        iso_year = week_start.isocalendar().year
+        forecast_df = pd.concat([forecast_df, pd.DataFrame({
+            'week_start': [week_start],
+            'quantity': [weekly_value],
+            'week_number': [iso_week],
+            'year': [iso_year],
+            'week_year': [f"{iso_year}-W{int(iso_week):02d}"]
+        })], ignore_index=True)
+    
+    return forecast_df
+
 def get_weekly_sales_history(product_df, store_name, product_name, weeks_back=52):
     """
     Hämtar veckovis försäljningshistorik för en produkt.
@@ -778,6 +824,8 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                     product_info['stock_warning_limit'] = product_info['Varningsgräns']
                 if 'Prognosticerad_försäljning' in product_info:
                     product_info['predicted_sales_units'] = product_info['Prognosticerad_försäljning']
+                if 'Leveransfrekvens_dagar' in product_info:
+                    product_info['delivery_frequency_days'] = product_info['Leveransfrekvens_dagar']
                 if 'Påfyllningsbehov' in product_info:
                     product_info['fill_up_quantity'] = product_info['Påfyllningsbehov']
                     product_info['needs_refill'] = product_info['Påfyllningsbehov'] > 0
@@ -793,6 +841,15 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                 
                 # Skapa sidan
                 predicted_sales_value = product_info.get('predicted_sales_units', 0)
+                delivery_frequency_days = product_info.get('delivery_frequency_days', 7)
+                
+                # Använd plocklistans prognos för att skapa veckovis prognos
+                forecast_from_picking_list = build_weekly_forecast_from_predicted_sales(
+                    predicted_sales_value, delivery_frequency_days, future_weeks=FORECAST_WEEKS
+                )
+                if len(forecast_from_picking_list) > 0:
+                    weekly_forecast = forecast_from_picking_list
+                
                 create_product_page(fig, sales_history, product_info, 
                                   predicted_sales_value, weekly_forecast, unit=unit)
                 
