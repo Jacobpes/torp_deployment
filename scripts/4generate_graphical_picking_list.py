@@ -18,6 +18,13 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from datetime import datetime, timedelta
 from sklearn.neighbors import KNeighborsRegressor
+try:
+    from sklearn.linear_model import LinearRegression, Ridge
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.metrics import mean_absolute_error
+    _ADVANCED_ML = True
+except ImportError:
+    _ADVANCED_ML = False
 import os
 import sys
 import glob
@@ -222,192 +229,200 @@ def load_and_prepare_sales_data(file_path):
     
     return df
 
+def _empty_forecast_df(first_future_monday, future_weeks):
+    """Returns a forecast DataFrame filled with zeros."""
+    rows = []
+    for i in range(future_weeks):
+        ws = first_future_monday + pd.Timedelta(weeks=i)
+        iso = ws.isocalendar()
+        rows.append({
+            'week_start': ws,
+            'quantity': 0.0,
+            'week_number': iso.week,
+            'year': iso.year,
+            'week_year': f"{iso.year}-W{int(iso.week):02d}"
+        })
+    return pd.DataFrame(rows)
+
+
+def _forecast_weeks_short_history(daily_sales, first_future_monday, future_weeks, ref_date):
+    """
+    For products with < 5 months history.
+    Uses KNN (k=min(4, n_complete_weeks), weights='distance') on weekly
+    aggregated data with features (week_of_year, month) so each future week
+    gets the weighted average of the 4 closest historical weeks -- giving
+    a slightly different prediction per week.
+    """
+    ds = daily_sales.copy()
+    ds['week'] = ds['date'].dt.to_period('W').apply(lambda r: r.start_time)
+    weekly = ds.groupby('week')['quantity'].sum().reset_index()
+    weekly = weekly.sort_values('week')
+
+    current_week_start = ref_date - pd.Timedelta(days=ref_date.dayofweek)
+    complete = weekly[weekly['week'] < current_week_start].copy()
+
+    if len(complete) == 0:
+        complete = weekly.copy()
+    if len(complete) == 0:
+        return _empty_forecast_df(first_future_monday, future_weeks)
+
+    complete['week_of_year'] = complete['week'].dt.isocalendar().week.astype(int)
+    complete['month'] = complete['week'].dt.month
+
+    k = min(4, len(complete))
+    model = KNeighborsRegressor(n_neighbors=k, weights='distance')
+    model.fit(complete[['week_of_year', 'month']], complete['quantity'])
+
+    rows = []
+    for i in range(future_weeks):
+        ws = first_future_monday + pd.Timedelta(weeks=i)
+        iso = ws.isocalendar()
+        pred = max(0.0, float(model.predict([[int(iso.week), ws.month]])[0]))
+        rows.append({
+            'week_start': ws,
+            'quantity': pred,
+            'week_number': iso.week,
+            'year': iso.year,
+            'week_year': f"{iso.year}-W{int(iso.week):02d}"
+        })
+    return pd.DataFrame(rows)
+
+
+def _compute_mae(y_true, y_pred):
+    """Mean absolute error that works even without sklearn.metrics."""
+    return float(np.mean(np.abs(np.array(y_true) - np.array(y_pred))))
+
+
+def _forecast_weeks_best_model(daily_sales, first_future_monday, future_weeks, today):
+    """
+    For products with >= 5 months history.
+    Tests KNN, Linear, Ridge, RandomForest, GradientBoosting against a
+    4-week-average baseline on a 28-day validation window, picks the winner,
+    then predicts day-by-day for each future week and aggregates to weekly
+    totals -- naturally producing different values per week.
+    Falls back to KNN-only when advanced sklearn modules are unavailable.
+    """
+    ds = daily_sales.copy()
+
+    ds['dayofweek'] = ds['date'].dt.dayofweek
+    ds['month'] = ds['date'].dt.month
+    ds['day'] = ds['date'].dt.day
+    ds['weekofyear'] = ds['date'].dt.isocalendar().week.astype(int)
+    ds['is_weekend'] = ds['dayofweek'].isin([5, 6]).astype(int)
+
+    feature_cols = ['dayofweek', 'month', 'day', 'weekofyear', 'is_weekend']
+    X = ds[feature_cols]
+    y = ds['quantity']
+
+    val_days = min(28, len(ds) // 4)
+    if val_days < 7:
+        return _forecast_weeks_short_history(daily_sales, first_future_monday, future_weeks, today)
+
+    X_train, X_val = X.iloc[:-val_days], X.iloc[-val_days:]
+    y_train, y_val = y.iloc[:-val_days], y.iloc[-val_days:]
+
+    # Baseline: flat daily rate from the 4 latest complete weeks in training data
+    train_ds = ds.iloc[:-val_days].copy()
+    train_ds['week'] = train_ds['date'].dt.to_period('W').apply(lambda r: r.start_time)
+    train_weekly = train_ds.groupby('week')['quantity'].sum()
+    train_end = train_ds['date'].iloc[-1]
+    cws = train_end - pd.Timedelta(days=train_end.dayofweek)
+    complete_train_weeks = train_weekly[train_weekly.index < cws]
+    if len(complete_train_weeks) > 0:
+        baseline_daily = complete_train_weeks.tail(min(4, len(complete_train_weeks))).mean() / 7.0
+    elif len(train_weekly) > 0:
+        baseline_daily = train_weekly.mean() / 7.0
+    else:
+        baseline_daily = 0.0
+    baseline_mae = _compute_mae(y_val, [baseline_daily] * len(y_val))
+
+    candidates = {
+        'knn_3': KNeighborsRegressor(n_neighbors=3),
+        'knn_5': KNeighborsRegressor(n_neighbors=5),
+        'knn_7': KNeighborsRegressor(n_neighbors=7),
+    }
+    if _ADVANCED_ML:
+        candidates['linear'] = LinearRegression()
+        candidates['ridge'] = Ridge(alpha=1.0)
+        candidates['rf'] = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+        candidates['gb'] = GradientBoostingRegressor(n_estimators=50, max_depth=5, random_state=42)
+
+    best_mae = baseline_mae
+    best_model = None
+
+    for name, model in candidates.items():
+        try:
+            model.fit(X_train, y_train)
+            preds = np.maximum(model.predict(X_val), 0)
+            mae = _compute_mae(y_val, preds)
+            if mae < best_mae:
+                best_mae = mae
+                best_model = model
+        except Exception:
+            continue
+
+    if best_model is None:
+        return _forecast_weeks_short_history(daily_sales, first_future_monday, future_weeks, today)
+
+    best_model.fit(X, y)
+
+    total_days = future_weeks * 7
+    future_dates = pd.date_range(first_future_monday, periods=total_days, freq='D')
+    fdf = pd.DataFrame({'date': future_dates})
+    fdf['dayofweek'] = fdf['date'].dt.dayofweek
+    fdf['month'] = fdf['date'].dt.month
+    fdf['day'] = fdf['date'].dt.day
+    fdf['weekofyear'] = fdf['date'].dt.isocalendar().week.astype(int)
+    fdf['is_weekend'] = fdf['dayofweek'].isin([5, 6]).astype(int)
+
+    fdf['quantity'] = np.maximum(best_model.predict(fdf[feature_cols]), 0)
+
+    fdf['week_start'] = fdf['date'] - pd.to_timedelta(fdf['date'].dt.dayofweek, unit='D')
+    weekly = fdf.groupby('week_start')['quantity'].sum().reset_index()
+    weekly = weekly.sort_values('week_start')
+    weekly['week_number'] = weekly['week_start'].dt.isocalendar().week
+    weekly['year'] = weekly['week_start'].dt.isocalendar().year
+    weekly['week_year'] = weekly.apply(
+        lambda r: f"{int(r['year'])}-W{int(r['week_number']):02d}", axis=1
+    )
+    return weekly
+
+
 def predict_weekly_sales(product_df, future_weeks=4):
     """
-    Prognostiserar veckovis försäljning för en produkt baserat på historisk data.
-    Returnerar DataFrame med veckostart och prognosticerad försäljning per vecka.
-    Alltid fyller i saknade dagar till dagens datum och prognostiserar från morgondagen.
+    Prognostiserar veckovis försäljning per future week.
+
+    - < 5 months history  → KNN (k=4) on weekly data: each future week
+      is the distance-weighted average of the 4 closest historical weeks
+    - >= 5 months history → best daily model from comparison, day-by-day
+      predictions aggregated to weekly totals (naturally different per week)
+
+    Returns DataFrame: week_start, quantity, week_number, year, week_year
     """
-    # Aggregera daglig försäljning (i antal enheter, inte värde)
     daily_sales = product_df.groupby('date')['quantity'].sum().reset_index()
     daily_sales = daily_sales.sort_values('date')
     daily_sales['date'] = pd.to_datetime(daily_sales['date'])
-    
-    # Fyll NaN-värden med 0
     daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-    
-    # Hämta dagens datum och första datumet i data
+
     today = pd.Timestamp.now().normalize()
     first_date = daily_sales['date'].min()
-    last_date_in_data = daily_sales['date'].max()
-    
-    # Säkerställ att data går till dagens datum
-    # Om sista datumet i data är tidigare än idag, fyll i saknade dagar till idag
-    if last_date_in_data < today:
-        # Skapa fullständig datumserie från första datumet till dagens datum
-        date_range = pd.date_range(start=first_date, end=today, freq='D')
-        daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
-        daily_sales = daily_sales.rename(columns={'index': 'date'})
-        last_date = today
-    else:
-        # Om data går längre än idag, använd bara data till idag
-        daily_sales = daily_sales[daily_sales['date'] <= today].copy()
-        # Fyll i saknade dagar från första datumet till idag
-        date_range = pd.date_range(start=first_date, end=today, freq='D')
-        daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
-        daily_sales = daily_sales.rename(columns={'index': 'date'})
-        last_date = today
-    
-    # Säkerställ att quantity är 0 för alla saknade värden
+
+    date_range = pd.date_range(start=first_date, end=today, freq='D')
+    daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
+    daily_sales = daily_sales.rename(columns={'index': 'date'})
     daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-    
-    # Räkna antal dagar med data
+
     days_with_data = len(daily_sales)
-    # Räkna antal månader (ungefär 30 dagar per månad)
     months_with_data = days_with_data / 30.0
-    
-    # Fall 1: Mindre än 4 veckors data (< 28 dagar)
-    # Använd veckovis genomsnitt av all data som är > 0
-    if days_with_data < 28:
-        # Aggregera till veckovis data för att få korrekt veckovis genomsnitt
-        daily_sales['week'] = daily_sales['date'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_sales = daily_sales.groupby('week')['quantity'].sum().reset_index()
-        
-        # Filtrera bort veckor med 0 försäljning för att få genomsnitt av faktisk försäljning
-        non_zero_weeks = weekly_sales[weekly_sales['quantity'] > 0]['quantity']
-        if len(non_zero_weeks) > 0:
-            # Beräkna genomsnittlig veckovis försäljning baserat på veckor med faktisk försäljning
-            avg_weekly_sales = non_zero_weeks.mean()
-        else:
-            # Om all försäljning är 0, använd 0
-            avg_weekly_sales = 0.0
-        
-        # Skapa veckovis prognos med samma värde för alla veckor
-        forecast_df = pd.DataFrame(columns=['week_start', 'quantity', 'week_number', 'year', 'week_year'])
-        tomorrow = last_date + pd.Timedelta(days=1)
-        days_until_monday = (7 - tomorrow.weekday()) % 7
-        if days_until_monday == 0:
-            first_future_monday = tomorrow
-        else:
-            first_future_monday = tomorrow + pd.Timedelta(days=days_until_monday)
-        
-        for week_num in range(future_weeks):
-            week_start = first_future_monday + pd.Timedelta(weeks=week_num)
-            forecast_df = pd.concat([forecast_df, pd.DataFrame({
-                'week_start': [week_start],
-                'quantity': [avg_weekly_sales],
-                'week_number': [week_num + 1],
-                'year': [week_start.year],
-                'week_year': [week_start.isocalendar()[1]]
-            })], ignore_index=True)
-        
-        return forecast_df
-    
-    # Fall 2: Mindre än 10 månaders data (< 300 dagar)
-    # Använd 4 veckors genomsnitt för att beräkna veckovis genomsnitt
-    elif months_with_data < 10:
-        # Aggregera till veckovis data för de senaste 4 veckorna
-        daily_sales['week'] = daily_sales['date'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_sales = daily_sales.groupby('week')['quantity'].sum().reset_index()
-        
-        # Ta de senaste 4 veckorna (eller så många som finns)
-        weeks_to_look_back = min(4, len(weekly_sales))
-        if weeks_to_look_back > 0:
-            recent_weekly_sales = weekly_sales.tail(weeks_to_look_back)['quantity']
-            # Om det finns försäljning i de senaste veckorna, använd genomsnitt
-            if recent_weekly_sales.sum() > 0:
-                avg_weekly_sales = recent_weekly_sales.mean()
-            else:
-                # Om ingen försäljning i senaste veckorna, använd genomsnitt av alla veckor med försäljning
-                non_zero_weeks = weekly_sales[weekly_sales['quantity'] > 0]['quantity']
-                if len(non_zero_weeks) > 0:
-                    avg_weekly_sales = non_zero_weeks.mean()
-                else:
-                    avg_weekly_sales = 0.0
-        else:
-            avg_weekly_sales = 0.0
-        
-        # Skapa veckovis prognos med samma värde för alla veckor
-        forecast_df = pd.DataFrame(columns=['week_start', 'quantity', 'week_number', 'year', 'week_year'])
-        tomorrow = last_date + pd.Timedelta(days=1)
-        days_until_monday = (7 - tomorrow.weekday()) % 7
-        if days_until_monday == 0:
-            first_future_monday = tomorrow
-        else:
-            first_future_monday = tomorrow + pd.Timedelta(days=days_until_monday)
-        
-        for week_num in range(future_weeks):
-            week_start = first_future_monday + pd.Timedelta(weeks=week_num)
-            forecast_df = pd.concat([forecast_df, pd.DataFrame({
-                'week_start': [week_start],
-                'quantity': [avg_weekly_sales],
-                'week_number': [week_num + 1],
-                'year': [week_start.year],
-                'week_year': [week_start.isocalendar()[1]]
-            })], ignore_index=True)
-        
-        return forecast_df
-    
-    # Feature engineering
-    daily_sales['dayofweek'] = daily_sales['date'].dt.dayofweek
-    daily_sales['month'] = daily_sales['date'].dt.month
-    daily_sales['day'] = daily_sales['date'].dt.day
-    daily_sales['is_weekend'] = daily_sales['dayofweek'].isin([5, 6]).astype(int)
-    
-    # Förbered features och target
-    X = daily_sales[['dayofweek', 'month', 'day', 'is_weekend']]
-    y = daily_sales['quantity']
-    
-    # Träna modell
-    model = KNeighborsRegressor(n_neighbors=3)
-    model.fit(X, y)
-    
-    # Förbered framtida datum: alltid hela veckor (måndag till söndag)
-    # Starta alltid från morgondagen och hitta nästa måndag
-    tomorrow = last_date + pd.Timedelta(days=1)
-    # Hitta nästa måndag efter morgondagen
-    # weekday() returnerar: 0=måndag, 1=tisdag, ..., 6=söndag
+
+    tomorrow = today + pd.Timedelta(days=1)
     days_until_monday = (7 - tomorrow.weekday()) % 7
-    if days_until_monday == 0:
-        # Om morgondagen är måndag, börja från morgondagen
-        first_future_monday = tomorrow
+    first_future_monday = tomorrow if days_until_monday == 0 else tomorrow + pd.Timedelta(days=days_until_monday)
+
+    if months_with_data < 5:
+        return _forecast_weeks_short_history(daily_sales, first_future_monday, future_weeks, today)
     else:
-        # Annars, hitta nästa måndag
-        first_future_monday = tomorrow + pd.Timedelta(days=days_until_monday)
-    total_future_days = future_weeks * 7
-    future_dates = pd.date_range(first_future_monday, periods=total_future_days, freq='D')
-    
-    future_df = pd.DataFrame({'date': future_dates})
-    future_df['dayofweek'] = future_df['date'].dt.dayofweek
-    future_df['month'] = future_df['date'].dt.month
-    future_df['day'] = future_df['date'].dt.day
-    future_df['is_weekend'] = future_df['dayofweek'].isin([5, 6]).astype(int)
-    X_future = future_df[['dayofweek', 'month', 'day', 'is_weekend']]
-    
-    # Prognostisera framtida försäljning (säkra att inga negativa värden)
-    y_future = model.predict(X_future)
-    y_future = np.maximum(y_future, 0)
-    
-    # Lägg till prediktioner i future_df
-    future_df['quantity'] = y_future
-    
-    # Beräkna veckostart (måndag) för varje dag
-    future_df['week_start'] = future_df['date'] - pd.to_timedelta(
-        future_df['date'].dt.dayofweek, unit='D'
-    )
-    
-    # Aggregera per vecka
-    weekly_predictions = future_df.groupby('week_start')['quantity'].sum().reset_index()
-    
-    # Beräkna veckonummer och år
-    weekly_predictions['week_number'] = weekly_predictions['week_start'].dt.isocalendar().week
-    weekly_predictions['year'] = weekly_predictions['week_start'].dt.isocalendar().year
-    weekly_predictions['week_year'] = (
-        weekly_predictions['year'].astype(str) + '-W' + 
-        weekly_predictions['week_number'].astype(str).str.zfill(2)
-    )
-    
-    return weekly_predictions
+        return _forecast_weeks_best_model(daily_sales, first_future_monday, future_weeks, today)
 
 def build_weekly_forecast_from_predicted_sales(predicted_sales_units, delivery_frequency_days, future_weeks=4):
     """
@@ -843,12 +858,11 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                 predicted_sales_value = product_info.get('predicted_sales_units', 0)
                 delivery_frequency_days = product_info.get('delivery_frequency_days', 7)
                 
-                # Använd plocklistans prognos för att skapa veckovis prognos
-                forecast_from_picking_list = build_weekly_forecast_from_predicted_sales(
-                    predicted_sales_value, delivery_frequency_days, future_weeks=FORECAST_WEEKS
-                )
-                if len(forecast_from_picking_list) > 0:
-                    weekly_forecast = forecast_from_picking_list
+                # Only fall back to flat forecast when ML forecast is empty
+                if len(weekly_forecast) == 0:
+                    weekly_forecast = build_weekly_forecast_from_predicted_sales(
+                        predicted_sales_value, delivery_frequency_days, future_weeks=FORECAST_WEEKS
+                    )
                 
                 create_product_page(fig, sales_history, product_info, 
                                   predicted_sales_value, weekly_forecast, unit=unit)

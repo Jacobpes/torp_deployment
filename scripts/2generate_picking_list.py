@@ -10,9 +10,13 @@ Detta script:
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.linear_model import LinearRegression, Ridge
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.metrics import mean_absolute_error
+try:
+    from sklearn.linear_model import LinearRegression, Ridge
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+    from sklearn.metrics import mean_absolute_error
+    _ADVANCED_ML = True
+except ImportError:
+    _ADVANCED_ML = False
 from datetime import datetime
 import os
 import sys
@@ -352,12 +356,18 @@ def _predict_weekly_average(daily_sales, forecast_days, ref_date):
     return 0.0
 
 
+def _compute_mae(y_true, y_pred):
+    """Mean absolute error that works even without sklearn.metrics."""
+    return float(np.mean(np.abs(np.array(y_true) - np.array(y_pred))))
+
+
 def _predict_best_model(daily_sales, forecast_days, today):
     """
     Train several candidate models, evaluate each on a held-out validation
     window (last 28 days), and use the winner to produce the final forecast.
     A simple 4-week-average baseline is included; if no ML model beats it
     the baseline is used instead.
+    Falls back to KNN-only when advanced sklearn modules are unavailable.
     """
     ds = daily_sales.copy()
 
@@ -383,17 +393,18 @@ def _predict_best_model(daily_sales, forecast_days, today):
         ds[['date', 'quantity']].iloc[:-val_days].copy(), val_days, train_end
     )
     baseline_daily = baseline_total / val_days if val_days > 0 else 0.0
-    baseline_mae = mean_absolute_error(y_val, [baseline_daily] * len(y_val))
+    baseline_mae = _compute_mae(y_val, [baseline_daily] * len(y_val))
 
     candidates = {
         'knn_3': KNeighborsRegressor(n_neighbors=3),
         'knn_5': KNeighborsRegressor(n_neighbors=5),
         'knn_7': KNeighborsRegressor(n_neighbors=7),
-        'linear': LinearRegression(),
-        'ridge': Ridge(alpha=1.0),
-        'rf': RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42),
-        'gb': GradientBoostingRegressor(n_estimators=50, max_depth=5, random_state=42),
     }
+    if _ADVANCED_ML:
+        candidates['linear'] = LinearRegression()
+        candidates['ridge'] = Ridge(alpha=1.0)
+        candidates['rf'] = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+        candidates['gb'] = GradientBoostingRegressor(n_estimators=50, max_depth=5, random_state=42)
 
     best_mae = baseline_mae
     best_model = None
@@ -402,7 +413,7 @@ def _predict_best_model(daily_sales, forecast_days, today):
         try:
             model.fit(X_train, y_train)
             preds = np.maximum(model.predict(X_val), 0)
-            mae = mean_absolute_error(y_val, preds)
+            mae = _compute_mae(y_val, preds)
             if mae < best_mae:
                 best_mae = mae
                 best_model = model
