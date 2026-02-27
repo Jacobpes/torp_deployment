@@ -299,25 +299,32 @@ def main():
     main_logger.info(f"  - Error log file: {ERROR_LOG_FILE}")
     main_logger.info("\n" + "="*80)
     
-    # Keep window open on Windows if running as executable
-    if sys.platform == 'win32' and getattr(sys, 'frozen', False):
-        try:
-            input("\nPress Enter to exit...")
-        except (EOFError, KeyboardInterrupt):
-            # Ignore if running non-interactively
-            pass
-    
+    # Programmet avslutas automatiskt när allt är klart
     return True
+
+def flush_and_exit(code):
+    """Flush all log handlers and force-exit the process immediately.
+    
+    Uses os._exit() to bypass PyInstaller's bootloader prompt
+    that would otherwise show "Press Enter to exit..." on Windows.
+    """
+    for handler in main_logger.handlers + error_logger.handlers:
+        handler.flush()
+    if hasattr(sys.stdout, 'flush'):
+        sys.stdout.flush()
+    if hasattr(sys.stderr, 'flush'):
+        sys.stderr.flush()
+    os._exit(code)
 
 if __name__ == "__main__":
     try:
         success = main()
-        sys.exit(0 if success else 1)
+        flush_and_exit(0 if success else 1)
     except KeyboardInterrupt:
         error_msg = "\n\nProcess interrupted by user."
         main_logger.error(error_msg)
         error_logger.error(error_msg)
-        sys.exit(1)
+        flush_and_exit(1)
     except Exception as e:
         error_msg = f"\n\nFATAL ERROR: {e}"
         main_logger.error(error_msg)
@@ -326,13 +333,7 @@ if __name__ == "__main__":
         tb_str = traceback.format_exc()
         main_logger.error(tb_str)
         error_logger.error(tb_str)
-        if sys.platform == 'win32' and getattr(sys, 'frozen', False):
-            try:
-                input("\nPress Enter to exit...")
-            except (EOFError, KeyboardInterrupt):
-                # Ignore if running non-interactively
-                pass
-        sys.exit(1)
+        flush_and_exit(1)
 
 
 

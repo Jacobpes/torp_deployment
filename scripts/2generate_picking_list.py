@@ -10,6 +10,9 @@ Detta script:
 import pandas as pd
 import numpy as np
 from sklearn.neighbors import KNeighborsRegressor
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error
 from datetime import datetime
 import os
 import sys
@@ -324,133 +327,136 @@ def filter_unit_mapping_to_stock(unit_mapping, stock_df):
     return filtered
 
 
-def predict_product_sales(product_df, forecast_days):
+def _predict_weekly_average(daily_sales, forecast_days, ref_date):
     """
-    Prognostiserar försäljning för en produkt baserat på historisk data.
-    Returnerar totalt antal enheter som förväntas säljas under framtida perioden.
-    Prognostiserar för exakt forecast_days dagar från morgondagen.
+    Forecast using the mean of the 4 latest *complete* calendar weeks.
+    The current (possibly incomplete) week is excluded so the average
+    is not pulled down by a partial week.
     """
-    # Aggregera daglig försäljning (i antal enheter, inte värde)
-    daily_sales = product_df.groupby('date')['quantity'].sum().reset_index()
-    daily_sales = daily_sales.sort_values('date')
-    daily_sales['date'] = pd.to_datetime(daily_sales['date'])
-    
-    # Fyll NaN-värden med 0
-    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-    
-    # Hämta dagens datum och första datumet i data
-    today = pd.Timestamp.now().normalize()
-    first_date = daily_sales['date'].min()
-    last_date_in_data = daily_sales['date'].max()
-    
-    # Säkerställ att data går till dagens datum
-    # Om sista datumet i data är tidigare än idag, fyll i saknade dagar till idag
-    if last_date_in_data < today:
-        # Skapa fullständig datumserie från första datumet till dagens datum
-        date_range = pd.date_range(start=first_date, end=today, freq='D')
-        daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
-        daily_sales = daily_sales.rename(columns={'index': 'date'})
-        last_date = today
-    else:
-        # Om data går längre än idag, använd bara data till idag
-        daily_sales = daily_sales[daily_sales['date'] <= today].copy()
-        # Fyll i saknade dagar från första datumet till idag
-        date_range = pd.date_range(start=first_date, end=today, freq='D')
-        daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
-        daily_sales = daily_sales.rename(columns={'index': 'date'})
-        last_date = today
-    
-    # Säkerställ att quantity är 0 för alla saknade värden
-    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-    
-    # Räkna antal dagar med data
-    days_with_data = len(daily_sales)
-    # Räkna antal månader (ungefär 30 dagar per månad)
-    months_with_data = days_with_data / 30.0
-    
-    # Fall 1: Mindre än 4 veckors data (< 28 dagar)
-    # Använd veckovis genomsnitt av all data som är > 0
-    if days_with_data < 28:
-        # Aggregera till veckovis data för att få korrekt veckovis genomsnitt
-        daily_sales['week'] = daily_sales['date'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_sales = daily_sales.groupby('week')['quantity'].sum().reset_index()
-        
-        # Filtrera bort veckor med 0 försäljning för att få genomsnitt av faktisk försäljning
-        non_zero_weeks = weekly_sales[weekly_sales['quantity'] > 0]['quantity']
-        if len(non_zero_weeks) > 0:
-            # Beräkna genomsnittlig veckovis försäljning
-            avg_weekly_sales = non_zero_weeks.mean()
-            # Konvertera till dagligt genomsnitt för att prognostisera för forecast_days
-            avg_daily_sales = avg_weekly_sales / 7.0
-            # Prognostisera för forecast_days dagar framåt
-            predicted_total = avg_daily_sales * forecast_days
-            return max(0.0, float(predicted_total))
-        else:
-            # Om all försäljning är 0, returnera 0
-            return 0.0
-    
-    # Fall 2: Mindre än 10 månaders data (< 300 dagar)
-    # Använd 4 veckors genomsnitt
-    elif months_with_data < 10:
-        # Aggregera till veckovis data för de senaste 4 veckorna
-        daily_sales['week'] = daily_sales['date'].dt.to_period('W').apply(lambda r: r.start_time)
-        weekly_sales = daily_sales.groupby('week')['quantity'].sum().reset_index()
-        
-        # Ta de senaste 4 veckorna (eller så många som finns)
-        weeks_to_look_back = min(4, len(weekly_sales))
-        if weeks_to_look_back > 0:
-            recent_weekly_sales = weekly_sales.tail(weeks_to_look_back)['quantity']
-            # Om det finns försäljning i de senaste veckorna, använd genomsnitt
-            if recent_weekly_sales.sum() > 0:
-                avg_weekly_sales = recent_weekly_sales.mean()
-            else:
-                # Om ingen försäljning i senaste veckorna, använd genomsnitt av alla veckor med försäljning
-                non_zero_weeks = weekly_sales[weekly_sales['quantity'] > 0]['quantity']
-                if len(non_zero_weeks) > 0:
-                    avg_weekly_sales = non_zero_weeks.mean()
-                else:
-                    avg_weekly_sales = 0.0
-            
-            # Konvertera till dagligt genomsnitt för att prognostisera för forecast_days
-            avg_daily_sales = avg_weekly_sales / 7.0
-            # Prognostisera för forecast_days dagar framåt
-            predicted_total = avg_daily_sales * forecast_days
-            return max(0.0, float(predicted_total))
-        else:
-            return 0.0
-    
-    # Feature engineering
-    daily_sales['dayofweek'] = daily_sales['date'].dt.dayofweek
-    daily_sales['month'] = daily_sales['date'].dt.month
-    daily_sales['day'] = daily_sales['date'].dt.day
-    daily_sales['is_weekend'] = daily_sales['dayofweek'].isin([5, 6]).astype(int)
-    
-    # Förbered features och target
-    X = daily_sales[['dayofweek', 'month', 'day', 'is_weekend']]
-    y = daily_sales['quantity']
-    
-    # Träna modell
-    model = KNeighborsRegressor(n_neighbors=3)
-    model.fit(X, y)
-    
-    # Förbered framtida datum: prognostisera för forecast_days dagar från morgondagen
-    tomorrow = last_date + pd.Timedelta(days=1)
-    # Prognostisera för exakt forecast_days dagar framåt
+    ds = daily_sales.copy()
+    ds['week'] = ds['date'].dt.to_period('W').apply(lambda r: r.start_time)
+    weekly_sales = ds.groupby('week')['quantity'].sum().reset_index()
+    weekly_sales = weekly_sales.sort_values('week')
+
+    current_week_start = ref_date - pd.Timedelta(days=ref_date.dayofweek)
+    complete_weeks = weekly_sales[weekly_sales['week'] < current_week_start]
+
+    if len(complete_weeks) == 0:
+        complete_weeks = weekly_sales
+
+    weeks_to_use = min(4, len(complete_weeks))
+    if weeks_to_use > 0:
+        avg_weekly = complete_weeks.tail(weeks_to_use)['quantity'].mean()
+        return max(0.0, float(avg_weekly / 7.0 * forecast_days))
+
+    return 0.0
+
+
+def _predict_best_model(daily_sales, forecast_days, today):
+    """
+    Train several candidate models, evaluate each on a held-out validation
+    window (last 28 days), and use the winner to produce the final forecast.
+    A simple 4-week-average baseline is included; if no ML model beats it
+    the baseline is used instead.
+    """
+    ds = daily_sales.copy()
+
+    ds['dayofweek'] = ds['date'].dt.dayofweek
+    ds['month'] = ds['date'].dt.month
+    ds['day'] = ds['date'].dt.day
+    ds['weekofyear'] = ds['date'].dt.isocalendar().week.astype(int)
+    ds['is_weekend'] = ds['dayofweek'].isin([5, 6]).astype(int)
+
+    feature_cols = ['dayofweek', 'month', 'day', 'weekofyear', 'is_weekend']
+    X = ds[feature_cols]
+    y = ds['quantity']
+
+    val_days = min(28, len(ds) // 4)
+    if val_days < 7:
+        return _predict_weekly_average(daily_sales, forecast_days, today)
+
+    X_train, X_val = X.iloc[:-val_days], X.iloc[-val_days:]
+    y_train, y_val = y.iloc[:-val_days], y.iloc[-val_days:]
+
+    train_end = ds['date'].iloc[-val_days - 1]
+    baseline_total = _predict_weekly_average(
+        ds[['date', 'quantity']].iloc[:-val_days].copy(), val_days, train_end
+    )
+    baseline_daily = baseline_total / val_days if val_days > 0 else 0.0
+    baseline_mae = mean_absolute_error(y_val, [baseline_daily] * len(y_val))
+
+    candidates = {
+        'knn_3': KNeighborsRegressor(n_neighbors=3),
+        'knn_5': KNeighborsRegressor(n_neighbors=5),
+        'knn_7': KNeighborsRegressor(n_neighbors=7),
+        'linear': LinearRegression(),
+        'ridge': Ridge(alpha=1.0),
+        'rf': RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42),
+        'gb': GradientBoostingRegressor(n_estimators=50, max_depth=5, random_state=42),
+    }
+
+    best_mae = baseline_mae
+    best_model = None
+
+    for name, model in candidates.items():
+        try:
+            model.fit(X_train, y_train)
+            preds = np.maximum(model.predict(X_val), 0)
+            mae = mean_absolute_error(y_val, preds)
+            if mae < best_mae:
+                best_mae = mae
+                best_model = model
+        except Exception:
+            continue
+
+    if best_model is None:
+        return _predict_weekly_average(daily_sales, forecast_days, today)
+
+    best_model.fit(X, y)
+
+    tomorrow = today + pd.Timedelta(days=1)
     future_dates = pd.date_range(tomorrow, periods=forecast_days, freq='D')
-    
     future_df = pd.DataFrame({'date': future_dates})
     future_df['dayofweek'] = future_df['date'].dt.dayofweek
     future_df['month'] = future_df['date'].dt.month
     future_df['day'] = future_df['date'].dt.day
+    future_df['weekofyear'] = future_df['date'].dt.isocalendar().week.astype(int)
     future_df['is_weekend'] = future_df['dayofweek'].isin([5, 6]).astype(int)
-    X_future = future_df[['dayofweek', 'month', 'day', 'is_weekend']]
-    
-    # Prognostisera framtida försäljning (säkra att inga negativa värden)
-    y_future = model.predict(X_future)
-    y_future = np.maximum(y_future, 0)
-    
-    # Returnera totalt antal enheter som förväntas säljas under forecast_days dagar
+
+    y_future = np.maximum(best_model.predict(future_df[feature_cols]), 0)
     return float(y_future.sum())
+
+
+def predict_product_sales(product_df, forecast_days):
+    """
+    Prognostiserar försäljning för en produkt baserat på historisk data.
+    Returnerar totalt antal enheter som förväntas säljas under forecast_days dagar.
+
+    - < 5 months of history  → average of the 4 latest complete weeks
+    - >= 5 months of history → best model chosen from a comparison of
+      KNN, Linear, Ridge, RandomForest, GradientBoosting (with a
+      4-week-average baseline; ML model is only used if it beats it)
+    """
+    daily_sales = product_df.groupby('date')['quantity'].sum().reset_index()
+    daily_sales = daily_sales.sort_values('date')
+    daily_sales['date'] = pd.to_datetime(daily_sales['date'])
+    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
+
+    today = pd.Timestamp.now().normalize()
+    first_date = daily_sales['date'].min()
+
+    date_range = pd.date_range(start=first_date, end=today, freq='D')
+    daily_sales = daily_sales.set_index('date').reindex(date_range, fill_value=0).reset_index()
+    daily_sales = daily_sales.rename(columns={'index': 'date'})
+    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
+
+    days_with_data = len(daily_sales)
+    months_with_data = days_with_data / 30.0
+
+    if months_with_data < 5:
+        return _predict_weekly_average(daily_sales, forecast_days, today)
+    else:
+        return _predict_best_model(daily_sales, forecast_days, today)
 
 def calculate_picking_quantity(current_stock, predicted_sales_total, stock_warning_limit, delivery_frequency_days):
     """
