@@ -65,6 +65,15 @@ else:
 FORECAST_WEEKS = 4  # Antal veckor att visa prognos för i grafen (för visning)
 
 
+def _safe_float(val, default=0.0):
+    """Safely convert a value to float, returning default for NaN/None/non-numeric."""
+    try:
+        result = float(val)
+        return result if not np.isnan(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
 def find_latest_file(pattern, directory):
     """
     Hittar den senaste filen baserat på datum i filnamnet.
@@ -242,6 +251,22 @@ def load_and_prepare_sales_data(file_path):
     if missing_cols:
         raise ValueError(
             f"Saknade kolumner: {missing_cols}. Tillgängliga kolumner: {list(df.columns)}")
+
+    # Fyll NaN-värden i quantity med 0
+    if 'quantity' in df.columns:
+        nan_count = df['quantity'].isna().sum()
+        if nan_count > 0:
+            print(f"  Fyller {nan_count} NaN-värden i quantity med 0")
+            df['quantity'] = df['quantity'].fillna(0)
+
+    # Drop rows with NaN in critical columns and ensure string types
+    before = len(df)
+    df = df.dropna(subset=['name', 'store'])
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing product name or store")
+    df['name'] = df['name'].astype(str)
+    df['store'] = df['store'].astype(str)
 
     print(f"  Laddat {len(df)} rader")
     print(f"  Butiker: {df['store'].nunique()}")
@@ -584,6 +609,12 @@ def create_product_page(fig, sales_history, product_info, predicted_sales, weekl
     """
     fig.clear()
 
+    # Ensure predicted_sales is a safe numeric value
+    try:
+        predicted_sales = float(predicted_sales) if pd.notna(predicted_sales) else 0.0
+    except (TypeError, ValueError):
+        predicted_sales = 0.0
+
     # Skapa layout med subplots
     gs = fig.add_gridspec(3, 2, height_ratios=[
                           0.8, 2.5, 1], hspace=0.35, wspace=0.3)
@@ -717,11 +748,11 @@ def create_product_page(fig, sales_history, product_info, predicted_sales, weekl
                           fontsize=13, fontweight='bold')
         ax_main.axis('off')
 
-    # Info-box 1: Lagerstatus
-    current_stock = product_info['current_stock']
-    stock_warning_limit = product_info['stock_warning_limit']
-    expected_stock_after = product_info['expected_stock_after_sales']
-    fill_up = product_info['fill_up_quantity']
+    # Info-box 1: Lagerstatus (ensure safe numeric values)
+    current_stock = _safe_float(product_info.get('current_stock', 0))
+    stock_warning_limit = _safe_float(product_info.get('stock_warning_limit', 0))
+    expected_stock_after = _safe_float(product_info.get('expected_stock_after_sales', 0))
+    fill_up = _safe_float(product_info.get('fill_up_quantity', 0))
 
     info_text1 = f"""LAGERSTATUS
 
@@ -813,20 +844,20 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                 product_names_in_sales = store_sales['name'].unique()
 
                 # Normalisera produktnamn för matchning
-                product_name_normalized = product_name_in_picking.strip().lower()
+                product_name_normalized = str(product_name_in_picking).strip().lower()
 
                 matched_product_name = None
 
                 # Försök exakt match först
                 for sales_name in product_names_in_sales:
-                    if product_name_normalized == sales_name.strip().lower():
+                    if product_name_normalized == str(sales_name).strip().lower():
                         matched_product_name = sales_name
                         break
 
                 # Om ingen exakt match, försök partiell match
                 if matched_product_name is None:
                     for sales_name in product_names_in_sales:
-                        sales_normalized = sales_name.strip().lower()
+                        sales_normalized = str(sales_name).strip().lower()
                         if (product_name_normalized in sales_normalized or
                                 sales_normalized in product_name_normalized):
                             matched_product_name = sales_name
@@ -961,6 +992,21 @@ def main():
     # Ladda plocklista
     print(f"\nLäser plocklista från {PICKING_LIST_PATH}...")
     picking_list_df = pd.read_csv(str(PICKING_LIST_PATH), sep=';')
+
+    # Drop rows with NaN in critical columns and ensure string types
+    before = len(picking_list_df)
+    picking_list_df = picking_list_df.dropna(subset=['store_name', 'Produktnamn'])
+    dropped = before - len(picking_list_df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing store_name or Produktnamn")
+    picking_list_df['store_name'] = picking_list_df['store_name'].astype(str)
+    picking_list_df['Produktnamn'] = picking_list_df['Produktnamn'].astype(str)
+
+    # Ensure numeric types for numeric columns
+    for col in ['saldo_denna_butik', 'Varningsgräns', 'Prognosticerad_försäljning', 'Påfyllningsbehov', 'Leveransfrekvens_dagar']:
+        if col in picking_list_df.columns:
+            picking_list_df[col] = pd.to_numeric(picking_list_df[col], errors='coerce').fillna(0)
+
     print(f"  Laddat {len(picking_list_df)} produkter")
     print(f"  Butiker: {picking_list_df['store_name'].nunique()}")
 

@@ -259,7 +259,7 @@ def get_product_unit(product_name, store_name, unit_mapping):
     Hämtar enhet för en produkt från unit_mapping.
     Returnerar enhet eller 'st' som standard.
     """
-    key = (product_name.lower(), store_name)
+    key = (str(product_name).strip().lower(), str(store_name).strip())
     if key in unit_mapping:
         return unit_mapping[key]
     return 'st'
@@ -351,6 +351,15 @@ def load_and_prepare_sales_data(file_path):
         if nan_count > 0:
             df['unit'] = df['unit'].fillna('st')
 
+    # Drop rows with NaN in critical columns and ensure string types
+    before = len(df)
+    df = df.dropna(subset=['name', 'store'])
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing product name or store")
+    df['name'] = df['name'].astype(str)
+    df['store'] = df['store'].astype(str)
+
     print(f"  Laddat {len(df)} rader")
     print(f"  Butiker: {df['store'].nunique()}")
     print(f"  Produkter: {df['name'].nunique()}")
@@ -364,6 +373,21 @@ def load_stock_data(file_path):
     file_path = Path(file_path)
     print(f"\nLäser lagerdata från {file_path}...")
     stock_df = pd.read_csv(str(file_path))
+
+    # Drop rows with NaN in critical columns
+    before = len(stock_df)
+    stock_df = stock_df.dropna(subset=['product_name', 'store_name'])
+    dropped = before - len(stock_df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing product_name or store_name")
+
+    # Ensure string types for name columns
+    stock_df['product_name'] = stock_df['product_name'].astype(str)
+    stock_df['store_name'] = stock_df['store_name'].astype(str)
+
+    # Ensure numeric types for stock columns
+    stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
+    stock_df['stock_warning_limit'] = pd.to_numeric(stock_df['stock_warning_limit'], errors='coerce').fillna(0)
 
     # Normalisera produktnamn för matchning
     stock_df['product_name_normalized'] = stock_df['product_name'].str.strip().str.lower()
@@ -594,8 +618,8 @@ def get_product_stock_info(stock_df, product_name, store_name):
     Hämtar lagerinformation för en produkt i en specifik butik.
     Returnerar (stock, stock_warning_limit) eller (0, 0) om inte hittad.
     """
-    product_normalized = product_name.strip().lower()
-    store_normalized = store_name.strip()
+    product_normalized = str(product_name).strip().lower()
+    store_normalized = str(store_name).strip()
 
     # Försök hitta match
     matched = stock_df[
@@ -626,7 +650,7 @@ def count_stores_selling_product(stock_df, product_name):
     """
     Räknar antal butiker som säljer en produkt (baserat på stock_report).
     """
-    product_normalized = product_name.strip().lower()
+    product_normalized = str(product_name).strip().lower()
 
     # Försök exakt match
     matched = stock_df[stock_df['product_name_normalized']
@@ -726,7 +750,13 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
 
     # Gå igenom alla produkter i sales data och matcha med leverantörer
     for product_name in sales_df['name'].unique():
+        if pd.isna(product_name):
+            continue
+        product_name = str(product_name)
         for store_name in sales_df[sales_df['name'] == product_name]['store'].unique():
+            if pd.isna(store_name):
+                continue
+            store_name = str(store_name)
             key = (product_name.lower(), store_name)
             if key in supplier_mapping:
                 supplier = supplier_mapping[key]

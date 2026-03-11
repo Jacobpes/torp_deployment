@@ -259,6 +259,15 @@ def load_and_prepare_sales_data(file_path):
             print(f"  Fyller {nan_count} NaN-värden i quantity med 0")
             df['quantity'] = df['quantity'].fillna(0)
 
+    # Drop rows with NaN in critical columns and ensure string types
+    before = len(df)
+    df = df.dropna(subset=['name', 'store'])
+    dropped = before - len(df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing product name or store")
+    df['name'] = df['name'].astype(str)
+    df['store'] = df['store'].astype(str)
+
     print(f"  Laddat {len(df)} rader")
     print(f"  Butiker: {df['store'].nunique()}")
     print(f"  Produkter: {df['name'].nunique()}")
@@ -272,6 +281,21 @@ def load_stock_data(file_path):
     file_path = Path(file_path)
     print(f"\nLäser lagerdata från {file_path}...")
     stock_df = pd.read_csv(str(file_path))
+
+    # Drop rows with NaN in critical columns
+    before = len(stock_df)
+    stock_df = stock_df.dropna(subset=['product_name', 'store_name'])
+    dropped = before - len(stock_df)
+    if dropped > 0:
+        print(f"  Removed {dropped} rows with missing product_name or store_name")
+
+    # Ensure string types for name columns
+    stock_df['product_name'] = stock_df['product_name'].astype(str)
+    stock_df['store_name'] = stock_df['store_name'].astype(str)
+
+    # Ensure numeric types for stock columns
+    stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
+    stock_df['stock_warning_limit'] = pd.to_numeric(stock_df['stock_warning_limit'], errors='coerce').fillna(0)
 
     # Normalisera produktnamn och butiksnamn för matchning
     stock_df['product_name_normalized'] = stock_df['product_name'].str.strip().str.lower()
@@ -518,16 +542,18 @@ def match_product_name(sales_name, stock_names):
     Försöker matcha produktnamn mellan försäljningsdata och lagerdata.
     Returnerar matchat namn eller None.
     """
-    sales_normalized = sales_name.strip().lower()
+    sales_normalized = str(sales_name).strip().lower()
 
     # Exakt match
     for stock_name in stock_names:
-        if sales_normalized == stock_name.strip().lower():
+        stock_norm = str(stock_name).strip().lower()
+        if sales_normalized == stock_norm:
             return stock_name
 
     # Partiell match (innehåller)
     for stock_name in stock_names:
-        if sales_normalized in stock_name.strip().lower() or stock_name.strip().lower() in sales_normalized:
+        stock_norm = str(stock_name).strip().lower()
+        if sales_normalized in stock_norm or stock_norm in sales_normalized:
             return stock_name
 
     return None
@@ -574,7 +600,7 @@ def get_product_unit(product_name, store_name, unit_mapping):
     Hämtar enhet för en produkt från unit_mapping.
     Returnerar enhet eller 'st' som standard.
     """
-    key = (product_name.lower(), store_name)
+    key = (str(product_name).strip().lower(), str(store_name).strip())
     if key in unit_mapping:
         return unit_mapping[key]
     return 'st'
@@ -626,6 +652,9 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
 
         store_results = []
         for product_name in products:
+            if pd.isna(product_name):
+                continue
+            product_name = str(product_name)
             product_sales = store_sales[store_sales['name']
                                         == product_name].copy()
 
@@ -688,7 +717,7 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
                 'store_name': store_name,  # Lägg till butiksnamn för script 4
                 'Produktnamn': matched_stock['product_name'],
                 'Produktkod': product_code,
-                'Produkt_ID': int(matched_stock['product_id']) if pd.notna(matched_stock['product_id']) else 0,
+                'Produkt_ID': int(float(matched_stock['product_id'])) if pd.notna(matched_stock['product_id']) else 0,
                 'Leveransfrekvens_dagar': delivery_frequency,
                 'saldo_denna_butik': current_stock,
                 'Varningsgräns': stock_warning_limit,
