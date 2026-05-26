@@ -13,359 +13,215 @@ Detta script:
    - beställningsbehov (beräknat så att saldo inte går under stock_warning_limit)
 """
 
-import pandas as pd
-import numpy as np
-from sklearn.neighbors import KNeighborsRegressor
-try:
-    from sklearn.linear_model import LinearRegression, Ridge
-    from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.metrics import mean_absolute_error
-    _ADVANCED_ML = True
-except ImportError:
-    _ADVANCED_ML = False
-from datetime import datetime
-import os
-import sys
-import glob
+import csv
 import re
+import sys
+from datetime import datetime
 from pathlib import Path
-import warnings
-warnings.filterwarnings('ignore')
+
+import pandas as pd
+
 try:
-    from openpyxl import load_workbook
     from openpyxl.utils import get_column_letter
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
     print("Warning: openpyxl not available. Excel export will be skipped.")
 
-# Hitta projektets rot-katalog (en nivå upp från scripts/ om scriptet är i scripts/)
-# When running as executable, use sys.executable to find where .exe is located
-if getattr(sys, 'frozen', False):
-    # Use sys.executable to find where .exe file is located (same as main.py)
-    PROJECT_ROOT = Path(sys.executable).parent.resolve()
-else:
-    SCRIPT_DIR = Path(__file__).parent.resolve()
-    if SCRIPT_DIR.name == 'scripts':
-        PROJECT_ROOT = SCRIPT_DIR.parent
-    else:
-        PROJECT_ROOT = SCRIPT_DIR
+_script_dir = Path(__file__).parent.resolve()
+if str(_script_dir) not in sys.path:
+    sys.path.insert(0, str(_script_dir))
 
-# Konfiguration - använd absoluta sökvägar
-# When running as executable, use organized folder structure
-if getattr(sys, 'frozen', False):
-    # Save in output/orderlistor subdirectory
-    OUTPUT_DIR = PROJECT_ROOT / 'output' / 'orderlistor'
-    DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / \
-        'nedladdningar'  # Downloads in data/nedladdningar
-    BESTALLNINGSFREKVENS_PATH = PROJECT_ROOT / 'data' / \
-        'parametrar' / 'Beställningsfrekvens.csv'
-else:
-    OUTPUT_DIR = PROJECT_ROOT / 'orderlistor'
-    DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'
-    BESTALLNINGSFREKVENS_PATH = PROJECT_ROOT / 'data' / \
-        'parametrar' / 'Beställningsfrekvens.csv'
+from _common import (
+    get_project_root,
+    get_param_file_path,
+    safe_filename,
+    clear_readonly,
+    preflight_writable,
+    find_latest_file,
+    load_and_prepare_sales_data,
+    predict_product_sales,
+    normalize_name,
+    normalize_name_series,
+    count_normalised_changes,
+)
 
+PROJECT_ROOT = get_project_root()
 
-def find_latest_file(pattern, directory):
-    """
-    Hittar den senaste filen baserat på datum i filnamnet.
-    Pattern ska vara t.ex. 'product_sales_*.csv' eller 'stock_report_*.csv'
-    """
-    directory = Path(directory)
-    files = glob.glob(str(directory / pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"Inga filer matchar mönstret {pattern} i {directory}")
+# OUTPUT_DIR contains the XLSX files the user opens. SYSTEM_DATA_DIR holds
+# the raw CSV copies for downstream tooling / debugging. Keeping them
+# separate makes "output" cleaner from a user's perspective.
+OUTPUT_DIR = PROJECT_ROOT / 'output' / 'orderlistor'
+SYSTEM_DATA_DIR = PROJECT_ROOT / 'system_data' / 'orderlistor'
+DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'
 
-    # Extrahera datum från filnamn och sortera
-    file_dates = []
-    for file in files:
-        # Försök hitta datum i formatet YYYY-MM-DD eller YYYY-MM-DD_to_YYYY-MM-DD
-        date_match = re.search(r'(\d{4}-\d{2}-\d{2})', os.path.basename(file))
-        if date_match:
-            # Om det finns två datum (t.ex. 2024-02-12_to_2025-12-09), ta det sista
-            all_dates = re.findall(
-                r'(\d{4}-\d{2}-\d{2})', os.path.basename(file))
-            if all_dates:
-                latest_date_in_filename = max(all_dates)
-                file_dates.append((latest_date_in_filename, file))
-
-    if not file_dates:
-        raise ValueError(f"Kunde inte hitta datum i filnamn för {pattern}")
-
-    # Sortera efter datum (senaste först)
-    file_dates.sort(key=lambda x: x[0], reverse=True)
-    latest_file = file_dates[0][1]
-    print(
-        f"  Hittade senaste fil: {os.path.basename(latest_file)} (datum: {file_dates[0][0]})")
-    return latest_file
+BESTALLNINGSFREKVENS_PATH = get_param_file_path('Beställningsfrekvens.csv')
 
 
 def load_bestallningsfrekvens(file_path):
-    """Läser parametrar/Beställningsfrekvens.csv och returnerar dictionary med frekvens per leverantör"""
+    """
+    Läser parametrar/Beställningsfrekvens.csv → {leverantör: frekvens_dagar}.
+
+    Faller tillbaka till tomt dict (→ default 7 dagar per leverantör) om filen
+    saknas eller är trasig, istället för att krascha hela steg 3. Det matchar
+    beteendet hos load_leveransfrekvens och gör att .exe:n förblir körbar
+    även om någon råkar radera parameterfilen från sharen.
+    """
     file_path = Path(file_path)
     print(f"\nLäser beställningsfrekvens från {file_path}...")
 
     if not file_path.exists():
-        raise FileNotFoundError(
-            f"Beställningsfrekvens-fil hittades inte: {file_path}")
+        print(
+            f"  Varning: Beställningsfrekvens-fil saknas: {file_path}\n"
+            f"  Använder standardvärde: 7 dagar för alla leverantörer."
+        )
+        return {}
 
-    # CSV-struktur (efter fix):
-    # Kolumn 1: "Leverantör" - leverantörsnamn (t.ex. "Snellman", "Arla")
-    # Kolumn 2: "e-post" - email-adress
-    # Kolumn 3: "Beställnings frekvens/antal dagar" - frekvens i dagar (t.ex. "7", "21")
-
-    # Läs CSV manuellt för att undvika problem med BOM och pandas tolkningsfel
-    import csv
-    rows = []
-    with open(str(file_path), 'r', encoding='utf-8-sig') as f:
-        reader = csv.reader(f, delimiter=';')
-        for row in reader:
-            rows.append(row)
+    try:
+        rows = []
+        with open(str(file_path), 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, delimiter=';')
+            for row in reader:
+                rows.append(row)
+    except OSError as e:
+        print(
+            f"  Varning: Kunde inte läsa {file_path}: {e}\n"
+            f"  Använder standardvärde: 7 dagar för alla leverantörer."
+        )
+        return {}
 
     if len(rows) < 2:
         print(
-            f"  Fel: CSV-filen har för få rader ({len(rows)}). Förväntar minst header + 1 datarad.")
+            f"  Fel: CSV-filen har för få rader ({len(rows)}). "
+            f"Förväntar minst header + 1 datarad."
+        )
         return {}
 
-    # Första raden är header, resten är data
     header = rows[0]
     data_rows = rows[1:]
 
     print(f"  Hittade {len(header)} kolumner: {header[:4]}...")
     print(f"  Hittade {len(data_rows)} datarader")
 
-    # Skapa dictionary: leverantör -> beställningsfrekvens (dagar)
     frekvenser = {}
 
-    # Kolumnindex: kolumn 0 = Leverantör, kolumn 2 = Beställnings frekvens/antal dagar
     leverantor_col_idx = 0
     frekvens_col_idx = 2
 
     if len(header) <= frekvens_col_idx:
         print(
-            f"  Fel: CSV-filen har för få kolumner ({len(header)}). Förväntar minst {frekvens_col_idx + 1} kolumner.")
+            f"  Fel: CSV-filen har för få kolumner ({len(header)}). "
+            f"Förväntar minst {frekvens_col_idx + 1} kolumner."
+        )
         return frekvenser
 
     print(
-        f"  Använder kolumn {leverantor_col_idx} för Leverantör: '{header[leverantor_col_idx]}'")
+        f"  Använder kolumn {leverantor_col_idx} för Leverantör: "
+        f"'{header[leverantor_col_idx]}'"
+    )
     print(
-        f"  Använder kolumn {frekvens_col_idx} för Frekvens: '{header[frekvens_col_idx]}'")
+        f"  Använder kolumn {frekvens_col_idx} för Frekvens: "
+        f"'{header[frekvens_col_idx]}'"
+    )
 
-    for row_idx, row in enumerate(data_rows):
+    for row in data_rows:
         if len(row) <= max(leverantor_col_idx, frekvens_col_idx):
             continue
-
-        leverantor_raw = row[leverantor_col_idx].strip(
-        ) if leverantor_col_idx < len(row) else ''
-        frekvens_raw = row[frekvens_col_idx].strip(
-        ) if frekvens_col_idx < len(row) else ''
+        # normalize_name (not just .strip()) so suppliers with NBSP, ZWSP
+        # or stray double spaces in the CSV match the form coming from
+        # product_sales_items via load_supplier_mapping.
+        leverantor_raw = normalize_name(
+            row[leverantor_col_idx] if leverantor_col_idx < len(row) else ''
+        )
+        frekvens_raw = (
+            row[frekvens_col_idx].strip() if frekvens_col_idx < len(row) else ''
+        )
 
         leverantor = leverantor_raw if leverantor_raw else None
-
-        # Validera leverantörsnamn - hoppa över om det är tomt
         if not leverantor or leverantor.lower() in ['nan', 'none', '']:
             continue
-
-        # Validera att frekvens_raw inte är tom
         if not frekvens_raw or frekvens_raw.strip() == '':
             continue
 
         try:
-            # Konvertera frekvens till heltal
             freq_str = str(frekvens_raw).strip()
-
-            # Ta bort alla icke-numeriska tecken förutom decimaltecken
-            freq_clean = ''.join(
-                c for c in freq_str if c.isdigit() or c == '.')
-
+            freq_clean = ''.join(c for c in freq_str if c.isdigit() or c == '.')
             if freq_clean:
                 frekvens_dagar = int(float(freq_clean))
-                # Validera att frekvensen är rimlig (mellan 1 och 365 dagar)
                 if 1 <= frekvens_dagar <= 365:
                     frekvenser[leverantor] = frekvens_dagar
                 else:
                     print(
-                        f"  Varning: Ovanlig frekvens för '{leverantor}': {frekvens_dagar} dagar (hoppar över)")
+                        f"  Varning: Ovanlig frekvens för '{leverantor}': "
+                        f"{frekvens_dagar} dagar (hoppar över)"
+                    )
             else:
                 print(
-                    f"  Varning: Kunde inte extrahera nummer från frekvens för '{leverantor}': '{frekvens_raw}'")
+                    f"  Varning: Kunde inte extrahera nummer från frekvens för "
+                    f"'{leverantor}': '{frekvens_raw}'"
+                )
         except (ValueError, TypeError) as e:
-            # Hoppa över rader där frekvensen inte kan tolkas
             print(
-                f"  Varning: Kunde inte tolka frekvens för '{leverantor}': '{frekvens_raw}' (fel: {e})")
+                f"  Varning: Kunde inte tolka frekvens för '{leverantor}': "
+                f"'{frekvens_raw}' (fel: {e})"
+            )
 
-    print(
-        f"  Laddade beställningsfrekvenser för {len(frekvenser)} leverantörer")
+    print(f"  Laddade beställningsfrekvenser för {len(frekvenser)} leverantörer")
     if len(frekvenser) > 0:
         print(f"  Exempel leverantörer: {list(frekvenser.keys())[:5]}")
-        # Visa några exempel med frekvenser
         for lev, freq in list(frekvenser.items())[:5]:
             print(f"    {lev}: {freq} dagar")
     else:
-        print(f"  VARNING: Inga leverantörer laddades! Kontrollera CSV-filen.")
-        print(f"  Förväntad struktur: Kolumn 0 = Leverantör, Kolumn 2 = Beställnings frekvens/antal dagar")
-        print(f"  Kontrollera att frekvenskolumnen innehåller numeriska värden (1-365)")
+        print(
+            "  VARNING: Inga leverantörer laddades! "
+            "Kontrollera CSV-filen."
+        )
 
     return frekvenser
 
 
 def load_supplier_mapping(file_path):
     """
-    Läser product_sales_items och skapar mapping: produkt -> leverantör
-    Returnerar tuple: (supplier_mapping, unit_mapping)
-    supplier_mapping: (product_name, store_name) -> supplier_name
-    unit_mapping: (product_name, store_name) -> unit
+    Läser product_sales_items och returnerar (supplier_mapping, unit_mapping).
+    Båda har nycklar (product_name_lower, store_name).
     """
     file_path = Path(file_path)
     print(f"\nLäser leverantörsinformation från {file_path}...")
     df = pd.read_csv(str(file_path))
 
-    # Filtrera bort order med status "error"
     if 'order_status' in df.columns:
         df = df[df['order_status'] == 'complete'].copy()
 
-    # Skapa mapping: produktnamn -> leverantör
-    # Använd både produktnamn och butik för att hantera samma produkt från olika leverantörer
     supplier_mapping = {}
     unit_mapping = {}
 
     for _, row in df.iterrows():
-        if pd.notna(row.get('supplier_name')) and pd.notna(row.get('product_name')):
-            product_name = str(row['product_name']).strip()
-            supplier_name = str(row['supplier_name']).strip()
-            store_name = str(row.get('store_name', '')).strip()
-
-            if product_name and supplier_name:
-                # Skapa nyckel baserat på produktnamn och butik
-                key = (product_name.lower(), store_name)
-                if key not in supplier_mapping:
-                    supplier_mapping[key] = supplier_name
-                    # Spara också enhet om den finns
-                    if 'unit' in row and pd.notna(row['unit']):
-                        unit_mapping[key] = str(row['unit']).strip()
-                    else:
-                        unit_mapping[key] = 'st'
-                # Om samma produkt har olika leverantörer i samma butik, ta den första
+        if not (pd.notna(row.get('supplier_name')) and pd.notna(row.get('product_name'))):
+            continue
+        product_name = normalize_name(row['product_name'])
+        supplier_name = normalize_name(row['supplier_name'])
+        store_name = normalize_name(row.get('store_name', ''))
+        if not (product_name and supplier_name):
+            continue
+        key = (product_name.lower(), store_name)
+        if key not in supplier_mapping:
+            supplier_mapping[key] = supplier_name
+            if 'unit' in row and pd.notna(row['unit']):
+                unit_mapping[key] = normalize_name(row['unit']) or 'st'
+            else:
+                unit_mapping[key] = 'st'
 
     print(
-        f"  Laddade leverantörsmappning för {len(supplier_mapping)} produkt-butik-kombinationer")
+        f"  Laddade leverantörsmappning för {len(supplier_mapping)} "
+        f"produkt-butik-kombinationer"
+    )
     return supplier_mapping, unit_mapping
 
 
 def get_product_unit(product_name, store_name, unit_mapping):
-    """
-    Hämtar enhet för en produkt från unit_mapping.
-    Returnerar enhet eller 'st' som standard.
-    """
-    key = (str(product_name).strip().lower(), str(store_name).strip())
-    if key in unit_mapping:
-        return unit_mapping[key]
-    return 'st'
-
-
-def load_and_prepare_sales_data(file_path):
-    """Läser och förbereder försäljningsdata"""
-    file_path = Path(file_path)
-    print(f"\nLäser försäljningsdata från {file_path}...")
-    df = pd.read_csv(str(file_path))
-
-    # Kontrollera vilken struktur filen har och mappa kolumner därefter
-    if 'period' in df.columns:
-        # Ny struktur med period-baserad data
-        df = df.rename(columns={
-            'period': 'date',
-            'store_name': 'store',
-            'product_name': 'name',
-            'total_quantity_sold': 'quantity',
-            'total_sales': 'line_price'
-        })
-        # Konvertera datum från period-kolumnen
-        df['date'] = pd.to_datetime(df['date']).dt.date
-        # Behåll unit-kolumnen om den finns (den ska redan finnas efter rename)
-        if 'unit' not in df.columns:
-            # Om unit saknas, sätt standardvärde
-            df['unit'] = 'st'
-    elif 'created_at' in df.columns:
-        # Gammal struktur med individuella orderrader (product_sales_items)
-        df = df.rename(columns={
-            'created_at': 'updated',
-            'store_name': 'store',
-            'product_name': 'name',
-            'line_total': 'line_price'
-        })
-        # Konvertera datum
-        df['updated'] = pd.to_datetime(df['updated'])
-        df['date'] = df['updated'].dt.date
-        # Behåll unit-kolumnen om den finns (product_sales_items har 'unit' kolumn)
-        if 'unit' not in df.columns:
-            df['unit'] = 'st'
-    else:
-        # Försök hitta datumkolumn
-        date_cols = [col for col in df.columns if 'date' in col.lower(
-        ) or 'created' in col.lower() or 'period' in col.lower()]
-        if date_cols:
-            df['date'] = pd.to_datetime(df[date_cols[0]]).dt.date
-        else:
-            raise ValueError(
-                f"Kunde inte hitta datumkolumn i filen. Tillgängliga kolumner: {list(df.columns)}")
-
-        # Mappa övriga kolumner om de finns
-        if 'store_name' in df.columns:
-            df['store'] = df['store_name']
-        if 'product_name' in df.columns:
-            df['name'] = df['product_name']
-        if 'quantity' not in df.columns:
-            # Försök hitta quantity-kolumn
-            qty_cols = [col for col in df.columns if 'quantity' in col.lower()]
-            if qty_cols:
-                df['quantity'] = df[qty_cols[0]]
-            else:
-                raise ValueError(
-                    f"Kunde inte hitta quantity-kolumn i filen. Tillgängliga kolumner: {list(df.columns)}")
-
-    # Behåll unit-kolumnen om den finns, annars sätt standard
-    if 'unit' not in df.columns:
-        df['unit'] = 'st'
-
-    # Filtrera bort order med status "error" om order_status kolumnen finns
-    if 'order_status' in df.columns:
-        initial_count = len(df)
-        df = df[df['order_status'] == 'complete'].copy()
-        filtered_count = len(df)
-        if initial_count != filtered_count:
-            print(
-                f"  Filtrerade bort {initial_count - filtered_count} rader med order_status != 'complete'")
-
-    # Fyll NaN-värden i quantity med 0
-    if 'quantity' in df.columns:
-        nan_count = df['quantity'].isna().sum()
-        if nan_count > 0:
-            print(f"  Fyller {nan_count} NaN-värden i quantity med 0")
-            df['quantity'] = df['quantity'].fillna(0)
-
-    # Fyll NaN-värden i unit med 'st'
-    if 'unit' in df.columns:
-        nan_count = df['unit'].isna().sum()
-        if nan_count > 0:
-            df['unit'] = df['unit'].fillna('st')
-
-    # Drop rows with NaN in critical columns and ensure string types
-    before = len(df)
-    df = df.dropna(subset=['name', 'store'])
-    dropped = before - len(df)
-    if dropped > 0:
-        print(f"  Removed {dropped} rows with missing product name or store")
-    df['name'] = df['name'].astype(str)
-    df['store'] = df['store'].astype(str)
-
-    print(f"  Laddat {len(df)} rader")
-    print(f"  Butiker: {df['store'].nunique()}")
-    print(f"  Produkter: {df['name'].nunique()}")
-    print(f"  Datumintervall: {df['date'].min()} till {df['date'].max()}")
-
-    return df
+    """Hämtar enhet för en produkt från unit_mapping. Standard: 'st'."""
+    key = (normalize_name(product_name).lower(), normalize_name(store_name))
+    return unit_mapping.get(key, 'st')
 
 
 def load_stock_data(file_path):
@@ -374,25 +230,30 @@ def load_stock_data(file_path):
     print(f"\nLäser lagerdata från {file_path}...")
     stock_df = pd.read_csv(str(file_path))
 
-    # Drop rows with NaN in critical columns
     before = len(stock_df)
     stock_df = stock_df.dropna(subset=['product_name', 'store_name'])
-    dropped = before - len(stock_df)
-    if dropped > 0:
-        print(f"  Removed {dropped} rows with missing product_name or store_name")
+    if before != len(stock_df):
+        print(f"  Removed {before - len(stock_df)} rows with missing product_name or store_name")
 
-    # Ensure string types for name columns
-    stock_df['product_name'] = stock_df['product_name'].astype(str)
-    stock_df['store_name'] = stock_df['store_name'].astype(str)
+    # Normalise whitespace so stock_report and sales data align on store/product
+    # identity even with stray NBSP, ZWSP, double spaces or BOM.
+    raw_store = stock_df['store_name'].astype('string')
+    raw_product = stock_df['product_name'].astype('string')
+    stock_df['store_name'] = normalize_name_series(stock_df['store_name'])
+    stock_df['product_name'] = normalize_name_series(stock_df['product_name'])
+    changed_store = count_normalised_changes(raw_store, stock_df['store_name'])
+    changed_product = count_normalised_changes(raw_product, stock_df['product_name'])
+    if changed_store or changed_product:
+        print(
+            f"  Normaliserade whitespace i lagerdata: "
+            f"{changed_store} butiksnamn och {changed_product} produktnamn justerade"
+        )
 
-    # Ensure numeric types for stock columns
     stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
-    stock_df['stock_warning_limit'] = pd.to_numeric(stock_df['stock_warning_limit'], errors='coerce').fillna(0)
+    stock_df['stock_warning_limit'] = pd.to_numeric(
+        stock_df['stock_warning_limit'], errors='coerce').fillna(0)
 
-    # Normalisera produktnamn för matchning
-    stock_df['product_name_normalized'] = stock_df['product_name'].str.strip().str.lower()
-
-    # Hantera negativa stock-värden (sätt till 0)
+    stock_df['product_name_normalized'] = stock_df['product_name'].str.lower()
     stock_df['stock'] = stock_df['stock'].clip(lower=0)
 
     print(f"  Laddat {len(stock_df)} rader")
@@ -403,7 +264,6 @@ def load_stock_data(file_path):
 
 
 def build_stock_index(stock_df):
-    """Bygger uppslag per butik för produkter i stock_report."""
     stock_by_store = {}
     if stock_df is None or len(stock_df) == 0:
         return stock_by_store
@@ -420,14 +280,12 @@ def build_stock_index(stock_df):
 
 
 def product_exists_in_stock(product_name, store_name, stock_by_store):
-    """Returnerar True om produkten finns i stock_report för given butik."""
     if store_name not in stock_by_store:
         return False
-    product_norm = str(product_name).strip().lower()
+    product_norm = normalize_name(product_name).lower()
     stock_names = stock_by_store[store_name]
     if product_norm in stock_names:
         return True
-    # Partiell matchning för att hantera små namnvariationer
     for stock_name in stock_names:
         if product_norm in stock_name or stock_name in product_norm:
             return True
@@ -435,10 +293,6 @@ def product_exists_in_stock(product_name, store_name, stock_by_store):
 
 
 def filter_sales_to_stock(sales_df, stock_df):
-    """
-    Filtrerar bort produkter som inte finns i stock_report.
-    Produkter som saknas i stock_report betraktas som utgångna.
-    """
     stock_by_store = build_stock_index(stock_df)
     if not stock_by_store:
         return sales_df
@@ -454,13 +308,11 @@ def filter_sales_to_stock(sales_df, stock_df):
     filtered_df = sales_df[mask].copy()
     removed = len(sales_df) - len(filtered_df)
     if removed > 0:
-        print(
-            f"  Filtrerade bort {removed} rader (produkter ej i stock_report)")
+        print(f"  Filtrerade bort {removed} rader (produkter ej i stock_report)")
     return filtered_df
 
 
 def filter_mapping_to_stock(mapping, stock_df):
-    """Filtrerar mapping till produkter som finns i stock_report."""
     stock_by_store = build_stock_index(stock_df)
     if not stock_by_store:
         return mapping
@@ -471,284 +323,111 @@ def filter_mapping_to_stock(mapping, stock_df):
     return filtered
 
 
-def _predict_weekly_average(daily_sales, forecast_days, ref_date):
-    """
-    Forecast using the mean of the 4 latest *complete* calendar weeks.
-    The current (possibly incomplete) week is excluded so the average
-    is not pulled down by a partial week.
-    """
-    ds = daily_sales.copy()
-    ds['week'] = ds['date'].dt.to_period('W').apply(lambda r: r.start_time)
-    weekly_sales = ds.groupby('week')['quantity'].sum().reset_index()
-    weekly_sales = weekly_sales.sort_values('week')
-
-    current_week_start = ref_date - pd.Timedelta(days=ref_date.dayofweek)
-    complete_weeks = weekly_sales[weekly_sales['week'] < current_week_start]
-
-    if len(complete_weeks) == 0:
-        complete_weeks = weekly_sales
-
-    weeks_to_use = min(4, len(complete_weeks))
-    if weeks_to_use > 0:
-        avg_weekly = complete_weeks.tail(weeks_to_use)['quantity'].mean()
-        return max(0.0, float(avg_weekly / 7.0 * forecast_days))
-
-    return 0.0
-
-
-def _compute_mae(y_true, y_pred):
-    """Mean absolute error that works even without sklearn.metrics."""
-    return float(np.mean(np.abs(np.array(y_true) - np.array(y_pred))))
-
-
-def _predict_best_model(daily_sales, forecast_days, today):
-    """
-    Train several candidate models, evaluate each on a held-out validation
-    window (last 28 days), and use the winner to produce the final forecast.
-    A simple 4-week-average baseline is included; if no ML model beats it
-    the baseline is used instead.
-    Falls back to KNN-only when advanced sklearn modules are unavailable.
-    """
-    ds = daily_sales.copy()
-
-    ds['dayofweek'] = ds['date'].dt.dayofweek
-    ds['month'] = ds['date'].dt.month
-    ds['day'] = ds['date'].dt.day
-    ds['weekofyear'] = ds['date'].dt.isocalendar().week.astype(int)
-    ds['is_weekend'] = ds['dayofweek'].isin([5, 6]).astype(int)
-
-    feature_cols = ['dayofweek', 'month', 'day', 'weekofyear', 'is_weekend']
-    X = ds[feature_cols]
-    y = ds['quantity']
-
-    val_days = min(28, len(ds) // 4)
-    if val_days < 7:
-        return _predict_weekly_average(daily_sales, forecast_days, today)
-
-    X_train, X_val = X.iloc[:-val_days], X.iloc[-val_days:]
-    y_train, y_val = y.iloc[:-val_days], y.iloc[-val_days:]
-
-    train_end = ds['date'].iloc[-val_days - 1]
-    baseline_total = _predict_weekly_average(
-        ds[['date', 'quantity']].iloc[:-val_days].copy(), val_days, train_end
-    )
-    baseline_daily = baseline_total / val_days if val_days > 0 else 0.0
-    baseline_mae = _compute_mae(y_val, [baseline_daily] * len(y_val))
-
-    candidates = {
-        'knn_3': KNeighborsRegressor(n_neighbors=3),
-        'knn_5': KNeighborsRegressor(n_neighbors=5),
-        'knn_7': KNeighborsRegressor(n_neighbors=7),
-    }
-    if _ADVANCED_ML:
-        candidates['linear'] = LinearRegression()
-        candidates['ridge'] = Ridge(alpha=1.0)
-        candidates['rf'] = RandomForestRegressor(
-            n_estimators=50, max_depth=10, random_state=42)
-        candidates['gb'] = GradientBoostingRegressor(
-            n_estimators=50, max_depth=5, random_state=42)
-
-    best_mae = baseline_mae
-    best_model = None
-
-    for name, model in candidates.items():
-        try:
-            model.fit(X_train, y_train)
-            preds = np.maximum(model.predict(X_val), 0)
-            mae = _compute_mae(y_val, preds)
-            if mae < best_mae:
-                best_mae = mae
-                best_model = model
-        except Exception:
-            continue
-
-    if best_model is None:
-        return _predict_weekly_average(daily_sales, forecast_days, today)
-
-    best_model.fit(X, y)
-
-    tomorrow = today + pd.Timedelta(days=1)
-    future_dates = pd.date_range(tomorrow, periods=forecast_days, freq='D')
-    future_df = pd.DataFrame({'date': future_dates})
-    future_df['dayofweek'] = future_df['date'].dt.dayofweek
-    future_df['month'] = future_df['date'].dt.month
-    future_df['day'] = future_df['date'].dt.day
-    future_df['weekofyear'] = future_df['date'].dt.isocalendar().week.astype(int)
-    future_df['is_weekend'] = future_df['dayofweek'].isin([5, 6]).astype(int)
-
-    y_future = np.maximum(best_model.predict(future_df[feature_cols]), 0)
-    return float(y_future.sum())
-
-
-def predict_product_sales(product_df, forecast_days):
-    """
-    Prognostiserar försäljning för en produkt baserat på historisk data.
-    Returnerar totalt antal enheter som förväntas säljas under forecast_days dagar.
-
-    - < 5 months of history  → average of the 4 latest complete weeks
-    - >= 5 months of history → best model chosen from a comparison of
-      KNN, Linear, Ridge, RandomForest, GradientBoosting (with a
-      4-week-average baseline; ML model is only used if it beats it)
-    """
-    daily_sales = product_df.groupby('date')['quantity'].sum().reset_index()
-    daily_sales = daily_sales.sort_values('date')
-    daily_sales['date'] = pd.to_datetime(daily_sales['date'])
-    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-
-    today = pd.Timestamp.now().normalize()
-    first_date = daily_sales['date'].min()
-
-    date_range = pd.date_range(start=first_date, end=today, freq='D')
-    daily_sales = daily_sales.set_index('date').reindex(
-        date_range, fill_value=0).reset_index()
-    daily_sales = daily_sales.rename(columns={'index': 'date'})
-    daily_sales['quantity'] = daily_sales['quantity'].fillna(0)
-
-    days_with_data = len(daily_sales)
-    months_with_data = days_with_data / 30.0
-
-    if months_with_data < 5:
-        return _predict_weekly_average(daily_sales, forecast_days, today)
-    else:
-        return _predict_best_model(daily_sales, forecast_days, today)
-
-
 def get_product_stock_info(stock_df, product_name, store_name):
-    """
-    Hämtar lagerinformation för en produkt i en specifik butik.
-    Returnerar (stock, stock_warning_limit) eller (0, 0) om inte hittad.
-    """
-    product_normalized = str(product_name).strip().lower()
-    store_normalized = str(store_name).strip()
+    """Returns (stock, stock_warning_limit) or (0, 0) if not found."""
+    product_normalized = normalize_name(product_name).lower()
+    store_normalized = normalize_name(store_name)
 
-    # Försök hitta match
     matched = stock_df[
-        (stock_df['product_name_normalized'] == product_normalized) &
-        (stock_df['store_name'] == store_normalized)
+        (stock_df['product_name_normalized'] == product_normalized)
+        & (stock_df['store_name'] == store_normalized)
     ]
-
     if len(matched) > 0:
-        stock = float(matched.iloc[0]['stock'])
-        warning_limit = float(matched.iloc[0]['stock_warning_limit'])
-        return stock, warning_limit
+        return float(matched.iloc[0]['stock']), float(matched.iloc[0]['stock_warning_limit'])
 
-    # Försök partiell match
     matched = stock_df[
-        (stock_df['product_name_normalized'].str.contains(product_normalized, na=False, regex=False)) &
-        (stock_df['store_name'] == store_normalized)
+        (stock_df['product_name_normalized'].str.contains(
+            product_normalized, na=False, regex=False))
+        & (stock_df['store_name'] == store_normalized)
     ]
-
     if len(matched) > 0:
-        stock = float(matched.iloc[0]['stock'])
-        warning_limit = float(matched.iloc[0]['stock_warning_limit'])
-        return stock, warning_limit
+        return float(matched.iloc[0]['stock']), float(matched.iloc[0]['stock_warning_limit'])
 
     return 0.0, 0.0
 
 
-def count_stores_selling_product(stock_df, product_name):
+def calculate_bestallningsbehov(current_stock_total, predicted_sales_total,
+                                stock_warning_limit_total, order_frequency_days):
     """
-    Räknar antal butiker som säljer en produkt (baserat på stock_report).
+    Efter order_frequency_days ska:
+      current_stock_total + beställningsbehov - predicted_sales_total >= stock_warning_limit_total
     """
-    product_normalized = str(product_name).strip().lower()
-
-    # Försök exakt match
-    matched = stock_df[stock_df['product_name_normalized']
-                       == product_normalized]
-
-    if len(matched) == 0:
-        # Försök partiell match
-        matched = stock_df[
-            stock_df['product_name_normalized'].str.contains(
-                product_normalized, na=False, regex=False)
-        ]
-
-    if len(matched) > 0:
-        return matched['store_name'].nunique()
-
-    return 0
-
-
-def calculate_bestallningsbehov(current_stock_total, predicted_sales_total, stock_warning_limit_total, order_frequency_days):
-    """
-    Beräknar beställningsbehov så att saldo inte går under stock_warning_limit
-    under beställningsfrekvens-perioden.
-
-    Logik:
-    - Efter order_frequency_days: current_stock_total + beställningsbehov - predicted_sales_total >= stock_warning_limit_total
-    - beställningsbehov >= stock_warning_limit_total + predicted_sales_total - current_stock_total
-    """
-    bestallningsbehov = stock_warning_limit_total + \
-        predicted_sales_total - current_stock_total
+    bestallningsbehov = stock_warning_limit_total + predicted_sales_total - current_stock_total
     return max(0.0, bestallningsbehov)
 
 
 def match_supplier_name(supplier_from_mapping, supplier_from_frekvens):
-    """
-    Försöker matcha leverantörsnamn mellan olika källor.
-    Returnerar matchat namn eller None.
-    """
+    """Försöker matcha leverantörsnamn mellan olika källor."""
     if not supplier_from_mapping or not supplier_from_frekvens:
         return None
 
-    mapping_normalized = str(supplier_from_mapping).strip().lower()
-    frekvens_normalized = str(supplier_from_frekvens).strip().lower()
+    mapping_normalized = normalize_name(supplier_from_mapping).lower()
+    frekvens_normalized = normalize_name(supplier_from_frekvens).lower()
 
-    # Ta bort vanliga suffix och prefix för bättre matchning
-    def normalize_name(name):
-        # Ta bort "Ab", "Oy", "Ab Oy" etc.
+    def strip_company_suffixes(name):
+        # Strip common Finnish/Swedish corporate suffixes so e.g. "Snellman"
+        # matches "Snellman Oy". Whitespace already normalised by caller, but
+        # collapse again after suffix removal in case "Foo Ab" -> "Foo  ".
         name = re.sub(r'\b(ab|oy|ab oy|aboy)\b', '', name)
-        # Ta bort extra mellanslag
         name = re.sub(r'\s+', ' ', name).strip()
         return name
 
-    mapping_clean = normalize_name(mapping_normalized)
-    frekvens_clean = normalize_name(frekvens_normalized)
+    mapping_clean = strip_company_suffixes(mapping_normalized)
+    frekvens_clean = strip_company_suffixes(frekvens_normalized)
 
-    # Exakt match
     if mapping_clean == frekvens_clean or mapping_normalized == frekvens_normalized:
         return supplier_from_frekvens
-
-    # Partiell match (en innehåller den andra)
     if mapping_clean in frekvens_clean or frekvens_clean in mapping_clean:
         return supplier_from_frekvens
 
-    # Matcha på första ordet (t.ex. "Snellman" matchar "Robin Snellman")
-    mapping_first_word = mapping_clean.split(
-    )[0] if mapping_clean.split() else ''
-    frekvens_first_word = frekvens_clean.split(
-    )[0] if frekvens_clean.split() else ''
-
-    if mapping_first_word and frekvens_first_word and mapping_first_word == frekvens_first_word:
+    mapping_first = mapping_clean.split()[0] if mapping_clean.split() else ''
+    frekvens_first = frekvens_clean.split()[0] if frekvens_clean.split() else ''
+    if mapping_first and frekvens_first and mapping_first == frekvens_first:
         return supplier_from_frekvens
 
-    # Matcha på sista ordet
-    mapping_last_word = mapping_clean.split(
-    )[-1] if mapping_clean.split() else ''
-    frekvens_last_word = frekvens_clean.split(
-    )[-1] if frekvens_clean.split() else ''
-
-    if mapping_last_word and frekvens_last_word and mapping_last_word == frekvens_last_word:
+    mapping_last = mapping_clean.split()[-1] if mapping_clean.split() else ''
+    frekvens_last = frekvens_clean.split()[-1] if frekvens_clean.split() else ''
+    if mapping_last and frekvens_last and mapping_last == frekvens_last:
         return supplier_from_frekvens
 
     return None
 
 
+def _write_orderlista(df, csv_path, excel_path):
+    """Skriv orderlista till CSV + Excel utan read-only-attribut."""
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    if csv_path.exists():
+        clear_readonly(csv_path)
+    df.to_csv(str(csv_path), index=False, sep=';', encoding='utf-8-sig')
+    clear_readonly(csv_path)
+
+    if excel_path is not None and OPENPYXL_AVAILABLE:
+        excel_path = Path(excel_path)
+        if excel_path.exists():
+            clear_readonly(excel_path)
+        with pd.ExcelWriter(str(excel_path), engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Orderlista', index=False)
+            worksheet = writer.sheets['Orderlista']
+            for idx, col in enumerate(df.columns, 1):
+                max_length = max(
+                    df[col].astype(str).map(len).max(),
+                    len(str(col)),
+                )
+                adjusted_width = min(max_length + 2, 50)
+                worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
+        clear_readonly(excel_path)
+
+
 def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestallningsfrekvenser):
-    """
-    Processar alla leverantörer och skapar orderlistor.
-    """
-    print("\n" + "="*80)
+    print("\n" + "=" * 80)
     print("GENERERAR ORDERLISTOR PER LEVERANTÖR")
-    print("="*80)
+    print("=" * 80)
 
-    # Skapa output-katalog
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Gruppera produkter per leverantör
-    supplier_products = {}  # supplier -> list of (product_name, store_name)
-
-    # Gå igenom alla produkter i sales data och matcha med leverantörer
+    supplier_products = {}
     for product_name in sales_df['name'].unique():
         if pd.isna(product_name):
             continue
@@ -760,247 +439,197 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
             key = (product_name.lower(), store_name)
             if key in supplier_mapping:
                 supplier = supplier_mapping[key]
-                if supplier not in supplier_products:
-                    supplier_products[supplier] = []
+                supplier_products.setdefault(supplier, [])
                 if (product_name, store_name) not in supplier_products[supplier]:
-                    supplier_products[supplier].append(
-                        (product_name, store_name))
+                    supplier_products[supplier].append((product_name, store_name))
 
     print(f"Hittade produkter för {len(supplier_products)} leverantörer")
 
-    # Processa varje leverantör
+    successful = []
+    failed = []
+
     for supplier_name, products in supplier_products.items():
-        # Hitta matchande leverantör i beställningsfrekvens
-        matched_supplier = None
-        order_frequency = None
+        try:
+            order_frequency = None
+            if supplier_name in bestallningsfrekvenser:
+                order_frequency = bestallningsfrekvenser[supplier_name]
+            else:
+                for frekvens_supplier, freq in bestallningsfrekvenser.items():
+                    if match_supplier_name(supplier_name, frekvens_supplier) \
+                            or match_supplier_name(frekvens_supplier, supplier_name):
+                        order_frequency = freq
+                        break
 
-        # Försök hitta exakt match först
-        if supplier_name in bestallningsfrekvenser:
-            matched_supplier = supplier_name
-            order_frequency = bestallningsfrekvenser[supplier_name]
-        else:
-            # Försök hitta partiell match (både vägar)
-            for frekvens_supplier, freq in bestallningsfrekvenser.items():
-                if match_supplier_name(supplier_name, frekvens_supplier):
-                    matched_supplier = frekvens_supplier
-                    order_frequency = freq
-                    break
-                # Försök även omvänt
-                if match_supplier_name(frekvens_supplier, supplier_name):
-                    matched_supplier = frekvens_supplier
-                    order_frequency = freq
-                    break
+            if order_frequency is None:
+                order_frequency = 7
+                print(
+                    f"\nVarning: Hittade ingen beställningsfrekvens för leverantör "
+                    f"'{supplier_name}'. Använder standardvärde: {order_frequency} dagar"
+                )
 
-        if order_frequency is None:
-            # Använd standardvärde 7 dagar om ingen match hittas
-            order_frequency = 7
             print(
-                f"\nVarning: Hittade ingen beställningsfrekvens för leverantör '{supplier_name}'.")
-            print(f"  Använder standardvärde: {order_frequency} dagar")
+                f"\nProcessar leverantör: {supplier_name} "
+                f"(beställningsfrekvens: {order_frequency} dagar)"
+            )
 
-        print(
-            f"\nProcessar leverantör: {supplier_name} (beställningsfrekvens: {order_frequency} dagar)")
+            order_list = []
+            for product_name, store_name in products:
+                product_sales = sales_df[
+                    (sales_df['name'] == product_name)
+                    & (sales_df['store'] == store_name)
+                ].copy()
+                if len(product_sales) == 0:
+                    continue
 
-        # Skapa orderlista för denna leverantör
-        order_list = []
+                try:
+                    predicted_sales = predict_product_sales(product_sales, order_frequency)
+                except Exception as e:
+                    print(
+                        f"  Varning: Kunde inte prognostisera för "
+                        f"{product_name} i {store_name}: {e}"
+                    )
+                    predicted_sales = 0.0
 
-        for product_name, store_name in products:
-            # Hämta försäljningsdata för denna produkt i denna butik
-            product_sales = sales_df[
-                (sales_df['name'] == product_name) &
-                (sales_df['store'] == store_name)
-            ].copy()
+                stock, warning_limit = get_product_stock_info(stock_df, product_name, store_name)
+                unit = get_product_unit(product_name, store_name, unit_mapping)
 
-            if len(product_sales) == 0:
+                order_list.append({
+                    'Produktnamn': product_name,
+                    'Butik': store_name,
+                    'Enhet': unit,
+                    'Prognosticerad_försäljning': predicted_sales,
+                    'Saldo': stock,
+                    'stock_warning_limit': warning_limit,
+                })
+
+            if len(order_list) == 0:
+                print(f"  Inga produkter att beställa för {supplier_name}")
                 continue
 
-            # Prognostisera försäljning för beställningsfrekvens-perioden
-            try:
-                predicted_sales = predict_product_sales(
-                    product_sales, order_frequency)
-            except Exception as e:
-                print(
-                    f"  Varning: Kunde inte prognostisera för {product_name} i {store_name}: {e}")
-                predicted_sales = 0.0
+            order_df = pd.DataFrame(order_list)
 
-            # Hämta lagerinformation
-            stock, warning_limit = get_product_stock_info(
-                stock_df, product_name, store_name)
+            unit_per_product = order_df.groupby('Produktnamn')['Enhet'].first().reset_index()
+            unit_per_product.columns = ['Produktnamn', 'Enhet']
 
-            # Hämta enhet för produkten från unit_mapping
-            unit = get_product_unit(product_name, store_name, unit_mapping)
+            aggregated = order_df.groupby('Produktnamn').agg({
+                'Prognosticerad_försäljning': 'sum',
+                'Saldo': 'sum',
+                'stock_warning_limit': 'sum',
+                'Butik': lambda x: ', '.join(x.unique()),
+            }).reset_index()
 
-            # Lägg till i orderlista
-            order_list.append({
-                'Produktnamn': product_name,
-                'Butik': store_name,
-                'Enhet': unit,
-                'Prognosticerad_försäljning': predicted_sales,
-                'Saldo': stock,
-                'stock_warning_limit': warning_limit
-            })
+            aggregated = aggregated.merge(unit_per_product, on='Produktnamn')
 
-        if len(order_list) == 0:
-            print(f"  Inga produkter att beställa för {supplier_name}")
-            continue
+            stores_per_product = order_df.groupby('Produktnamn')['Butik'].nunique().reset_index()
+            stores_per_product.columns = ['Produktnamn', 'Antal_butiker']
+            aggregated = aggregated.merge(stores_per_product, on='Produktnamn')
 
-        # Konvertera till DataFrame och aggregera per produkt (summera över butiker)
-        order_df = pd.DataFrame(order_list)
+            aggregated['beställningsbehov'] = aggregated.apply(
+                lambda row: calculate_bestallningsbehov(
+                    row['Saldo'],
+                    row['Prognosticerad_försäljning'],
+                    row['stock_warning_limit'],
+                    order_frequency,
+                ),
+                axis=1,
+            )
 
-        # Gruppera per produkt och summera
-        # Hämta enhet från första förekomsten (samma produkt bör ha samma enhet)
-        unit_per_product = order_df.groupby(
-            'Produktnamn')['Enhet'].first().reset_index()
-        unit_per_product.columns = ['Produktnamn', 'Enhet']
+            aggregated['Orderfrekvens_dagar'] = order_frequency
+            aggregated = aggregated.sort_values('beställningsbehov', ascending=False)
 
-        aggregated = order_df.groupby('Produktnamn').agg({
-            'Prognosticerad_försäljning': 'sum',  # Total försäljning över alla butiker
-            'Saldo': 'sum',  # Total saldo över alla butiker
-            'stock_warning_limit': 'sum',  # Total warning limit över alla butiker
-            'Butik': lambda x: ', '.join(x.unique())  # Lista butiker
-        }).reset_index()
+            column_order = [
+                'Produktnamn',
+                'Enhet',
+                'Orderfrekvens_dagar',
+                'Prognosticerad_försäljning',
+                'Saldo',
+                'stock_warning_limit',
+                'Antal_butiker',
+                'beställningsbehov',
+                'Butik',
+            ]
+            available_columns = [c for c in column_order if c in aggregated.columns]
+            aggregated = aggregated[available_columns]
 
-        # Lägg till enhet
-        aggregated = aggregated.merge(unit_per_product, on='Produktnamn')
+            for col in ('Prognosticerad_försäljning', 'beställningsbehov',
+                        'Saldo', 'stock_warning_limit'):
+                if col in aggregated.columns:
+                    aggregated[col] = aggregated[col].round(1)
 
-        # Räkna antal butiker per produkt
-        stores_per_product = order_df.groupby(
-            'Produktnamn')['Butik'].nunique().reset_index()
-        stores_per_product.columns = ['Produktnamn', 'Antal_butiker']
-        aggregated = aggregated.merge(stores_per_product, on='Produktnamn')
+            safe_supplier_name = safe_filename(supplier_name)
+            # CSV → system_data (intern systemdata). XLSX → output (för användaren).
+            output_file_csv = SYSTEM_DATA_DIR / f'Orderlista_{safe_supplier_name}.csv'
+            output_file_xlsx = (
+                OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.xlsx'
+                if OPENPYXL_AVAILABLE else None
+            )
 
-        # stock_warning_limit är redan summerad över alla butiker (rad 661), ingen ytterligare multiplikation behövs
+            _write_orderlista(aggregated, output_file_csv, output_file_xlsx)
 
-        # Beräkna beställningsbehov
-        aggregated['beställningsbehov'] = aggregated.apply(
-            lambda row: calculate_bestallningsbehov(
-                row['Saldo'],
-                row['Prognosticerad_försäljning'],
-                row['stock_warning_limit'],
-                order_frequency
-            ),
-            axis=1
-        )
+            print(
+                f"  [OK] Sparade orderlista med {len(aggregated)} produkter "
+                f"till {output_file_csv}"
+            )
+            if OPENPYXL_AVAILABLE and output_file_xlsx is not None:
+                print(f"  [OK] Sparade Excel-fil: {output_file_xlsx}")
+            print(
+                f"    Totalt beställningsbehov: "
+                f"{aggregated['beställningsbehov'].sum():.1f} enheter"
+            )
+            successful.append(supplier_name)
 
-        # Lägg till orderfrekvens som kolumn
-        aggregated['Orderfrekvens_dagar'] = order_frequency
+        except Exception as e:
+            # En enskild leverantörs fel ska inte stoppa resten av rapporten.
+            import traceback
+            print(f"  [WARNING] Kunde inte generera orderlista för {supplier_name}: {e}")
+            traceback.print_exc()
+            failed.append((supplier_name, str(e)))
 
-        # Sortera efter beställningsbehov (högst först)
-        aggregated = aggregated.sort_values(
-            'beställningsbehov', ascending=False)
-
-        # Ordna kolumner i logisk ordning
-        column_order = [
-            'Produktnamn',
-            'Enhet',
-            'Orderfrekvens_dagar',
-            'Prognosticerad_försäljning',
-            'Saldo',
-            'stock_warning_limit',
-            'Antal_butiker',
-            'beställningsbehov',
-            'Butik'
-        ]
-        # Lägg bara till kolumner som faktiskt finns
-        available_columns = [
-            col for col in column_order if col in aggregated.columns]
-        aggregated = aggregated[available_columns]
-
-        # Formatera data
-        # Prognosticerad_försäljning och beställningsbehov ska ha 1 decimal
-        if 'Prognosticerad_försäljning' in aggregated.columns:
-            aggregated['Prognosticerad_försäljning'] = aggregated['Prognosticerad_försäljning'].round(
-                1)
-        if 'beställningsbehov' in aggregated.columns:
-            aggregated['beställningsbehov'] = aggregated['beställningsbehov'].round(
-                1)
-        # Saldo och stock_warning_limit kan också ha 1 decimal för konsistens
-        if 'Saldo' in aggregated.columns:
-            aggregated['Saldo'] = aggregated['Saldo'].round(1)
-        if 'stock_warning_limit' in aggregated.columns:
-            aggregated['stock_warning_limit'] = aggregated['stock_warning_limit'].round(
-                1)
-
-        # Spara till CSV
-        safe_supplier_name = supplier_name.replace(
-            '/', '_').replace('\\', '_').replace(':', '_')
-        output_file_csv = OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.csv'
-        aggregated.to_csv(str(output_file_csv), index=False,
-                          sep=';', encoding='utf-8-sig')
-
-        # Spara till Excel med auto-anpassade kolumnbredder
-        if OPENPYXL_AVAILABLE:
-            output_file_xlsx = OUTPUT_DIR / \
-                f'Orderlista_{safe_supplier_name}.xlsx'
-            with pd.ExcelWriter(str(output_file_xlsx), engine='openpyxl') as writer:
-                aggregated.to_excel(
-                    writer, sheet_name='Orderlista', index=False)
-                worksheet = writer.sheets['Orderlista']
-
-                # Auto-anpassa kolumnbredder
-                for idx, col in enumerate(aggregated.columns, 1):
-                    max_length = max(
-                        aggregated[col].astype(str).map(len).max(),
-                        len(str(col))
-                    )
-                    # Sätt en max-bredd för att undvika för breda kolumner
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[get_column_letter(
-                        idx)].width = adjusted_width
-
-        print(
-            f"  [OK] Sparade orderlista med {len(aggregated)} produkter till {output_file_csv}")
-        if OPENPYXL_AVAILABLE:
-            print(f"  [OK] Sparade Excel-fil: {output_file_xlsx}")
-        print(
-            f"    Totalt beställningsbehov: {aggregated['beställningsbehov'].sum():.1f} enheter")
+    print(f"\n{'=' * 80}")
+    print(f"Klara orderlistor: {len(successful)} av {len(supplier_products)}")
+    if failed:
+        print(f"Misslyckade leverantörer ({len(failed)}):")
+        for name, err in failed:
+            print(f"  - {name}: {err}")
+    print(f"{'=' * 80}")
 
 
 def main():
-    """Huvudfunktion"""
-    print("="*80)
+    print("=" * 80)
     print("ORDERLISTA GENERATOR - PER LEVERANTÖR MED BESTÄLLNINGSFREKVENS")
-    print("="*80)
+    print("=" * 80)
     print(f"Datum: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Ensure directories exist
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     BESTALLNINGSFREKVENS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    # Hitta senaste filer automatiskt
+    preflight_writable(OUTPUT_DIR)
+    preflight_writable(SYSTEM_DATA_DIR)
+
     print("\nHittar senaste datafiler...")
-    latest_sales_file = find_latest_file(
-        'product_sales_*.csv', DATA_DOWNLOADS_DIR)
-    latest_stock_file = find_latest_file(
-        'stock_report_*.csv', DATA_DOWNLOADS_DIR)
-    latest_items_file = find_latest_file(
-        'product_sales_items_*.csv', DATA_DOWNLOADS_DIR)
+    latest_sales_file = find_latest_file('product_sales_*.csv', DATA_DOWNLOADS_DIR)
+    latest_stock_file = find_latest_file('stock_report_*.csv', DATA_DOWNLOADS_DIR)
+    latest_items_file = find_latest_file('product_sales_items_*.csv', DATA_DOWNLOADS_DIR)
 
-    # Ladda beställningsfrekvenser
-    bestallningsfrekvenser = load_bestallningsfrekvens(
-        BESTALLNINGSFREKVENS_PATH)
-
-    # Ladda leverantörsmappning och enhetsmappning
+    bestallningsfrekvenser = load_bestallningsfrekvens(BESTALLNINGSFREKVENS_PATH)
     supplier_mapping, unit_mapping = load_supplier_mapping(latest_items_file)
 
-    # Ladda försäljnings- och lagerdata
-    sales_df = load_and_prepare_sales_data(latest_sales_file)
+    sales_df = load_and_prepare_sales_data(latest_sales_file, keep_unit=True)
     stock_df = load_stock_data(latest_stock_file)
 
-    # Filtrera bort produkter som inte finns i stock_report
     sales_df = filter_sales_to_stock(sales_df, stock_df)
     supplier_mapping = filter_mapping_to_stock(supplier_mapping, stock_df)
     unit_mapping = filter_mapping_to_stock(unit_mapping, stock_df)
 
-    # Processa leverantörer och skapa orderlistor
-    process_suppliers(sales_df, stock_df, supplier_mapping,
-                      unit_mapping, bestallningsfrekvenser)
+    process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestallningsfrekvenser)
 
-    print(f"\n{'='*80}")
+    print(f"\n{'=' * 80}")
     print("KLAR!")
-    print(f"{'='*80}")
-    print(f"Orderlistor sparade i mappen: {OUTPUT_DIR}/")
+    print(f"{'=' * 80}")
+    print(f"Excel-orderlistor (för användare) sparade i: {OUTPUT_DIR}/")
+    print(f"CSV-orderlistor (systemdata) sparade i:     {SYSTEM_DATA_DIR}/")
 
 
 if __name__ == "__main__":

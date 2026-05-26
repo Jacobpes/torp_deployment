@@ -43,16 +43,30 @@ def download_files():
     # Ensure download directory exists
     download_dir.mkdir(parents=True, exist_ok=True)
     
-    # Remove all existing files in the download directory
+    # Remove all existing files in the download directory. Tolerate
+    # files that vanish between listing and unlink (race condition) or
+    # are locked by another process - we just keep going and let the
+    # subsequent download overwrite what remains.
     print("Cleaning download directory...")
     existing_files = list(download_dir.glob("*"))
     if existing_files:
         removed_count = 0
+        failed_count = 0
         for file_path in existing_files:
-            if file_path.is_file():
-                file_path.unlink()
+            if not file_path.is_file():
+                continue
+            try:
+                file_path.unlink(missing_ok=True)
                 removed_count += 1
-        print(f"Removed {removed_count} existing file(s) from download directory.\n")
+            except OSError as e:
+                # File locked / permission denied / disappeared with an
+                # error other than FileNotFoundError. Log and continue.
+                failed_count += 1
+                print(f"  [WARNING] Could not delete {file_path.name}: {e}")
+        msg = f"Removed {removed_count} existing file(s) from download directory."
+        if failed_count:
+            msg += f" Skipped {failed_count} file(s) that could not be deleted."
+        print(msg + "\n")
     else:
         print("Download directory is already empty.\n")
     

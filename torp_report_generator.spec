@@ -1,5 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 # PyInstaller spec file for torp_report_generator
+#
+# Parameter-CSV-filerna bundlas som FALLBACK. Vid körning letar scripten
+# (via _common.get_param_file_path) FÖRST i <exe-mapp>/data/parametrar/,
+# vilket är den användareditbara platsen som operatören kan uppdatera utan
+# rebuild. Om den inte finns används den bundlade kopian under sys._MEIPASS.
+# Detta gör att man kan släppa en ny version av .exe-filen utan att tappa
+# anpassade leverans-/beställningsfrekvenser - men också att .exe:n fungerar
+# på en helt tom installation, eftersom defaultvärdena alltid följer med.
 
 block_cipher = None
 
@@ -8,8 +16,11 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('data/parametrar/Beställningsfrekvens.csv', 'data/parametrar'),  # Extrahera till data/parametrar
-        ('data/parametrar/Leveransfrekvens.csv', 'data/parametrar'),     # Extrahera till data/parametrar
+        # Fallback-värden inbäddade i .exe; körtiden föredrar
+        # <exe-mapp>/data/parametrar/* om dessa finns.
+        ('data/parametrar/Beställningsfrekvens.csv', 'data/parametrar'),
+        ('data/parametrar/Leveransfrekvens.csv', 'data/parametrar'),
+        # Hela scripts/-mappen, inklusive _common.py som alla scripts importerar.
         ('scripts', 'scripts'),
     ],
     hiddenimports=[

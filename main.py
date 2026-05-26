@@ -39,11 +39,15 @@ os.chdir(script_dir)
 LOG_FILE = script_dir / 'torp_report_generator.log'
 ERROR_LOG_FILE = script_dir / 'torp_report_generator_errors.log'
 
-# Clear log files at start of each run
-if LOG_FILE.exists():
-    LOG_FILE.unlink()
-if ERROR_LOG_FILE.exists():
-    ERROR_LOG_FILE.unlink()
+# Clear log files at start of each run. Tolerate races / missing files /
+# files locked by another reader - "already gone" is the desired end state.
+for _log_path in (LOG_FILE, ERROR_LOG_FILE):
+    try:
+        _log_path.unlink(missing_ok=True)
+    except OSError as _e:
+        # File is open in a tail process or AV scanner - keep going,
+        # the FileHandler below will append rather than overwrite.
+        print(f"[WARN] Could not clear {_log_path}: {_e}")
 
 # Configure main logger (logs everything)
 main_logger = logging.getLogger('main')
@@ -292,10 +296,13 @@ def main():
     main_logger.info(f"Finished at: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
     main_logger.info(f"Total duration: {duration}")
     main_logger.info("\nGenerated files:")
-    main_logger.info(f"  - Picking lists: {script_dir / 'output' / 'plocklistor'}")
-    main_logger.info(f"  - Order lists: {script_dir / 'output' / 'orderlistor'}")
-    main_logger.info(f"  - Graphical picking lists: {script_dir / 'output' / 'plocklistor'}")
-    main_logger.info(f"  - Log file: {LOG_FILE}")
+    main_logger.info("  User-facing reports (output/):")
+    main_logger.info(f"    - Picking lists (XLSX + PDF): {script_dir / 'output' / 'plocklistor'}")
+    main_logger.info(f"    - Order lists (XLSX):         {script_dir / 'output' / 'orderlistor'}")
+    main_logger.info("  System data (system_data/) - working CSV files:")
+    main_logger.info(f"    - Picking list CSVs: {script_dir / 'system_data' / 'plocklistor'}")
+    main_logger.info(f"    - Order list CSVs:   {script_dir / 'system_data' / 'orderlistor'}")
+    main_logger.info(f"  - Log file:       {LOG_FILE}")
     main_logger.info(f"  - Error log file: {ERROR_LOG_FILE}")
     main_logger.info("\n" + "="*80)
     

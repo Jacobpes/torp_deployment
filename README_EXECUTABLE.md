@@ -16,17 +16,31 @@ This is a Windows executable that automates the entire report generation process
 The executable automatically:
 
 1. **Downloads** latest data from SFTP server (if SSH key is available)
-2. **Generates** `picking_list_results.csv` - picking list per store
-3. **Generates** order lists in `orderlistor/` folder - one CSV file per supplier
-4. **Generates** graphical picking lists in `picking_list_graphical/` folder - PDF files per store
+2. **Generates** picking lists per store (Excel + PDF) in `output/plocklistor/`
+3. **Generates** order lists per supplier (Excel) in `output/orderlistor/`
+4. **Keeps** machine-readable CSV copies in `system_data/` for the pipeline
+   itself - these are not needed by end users
 
 ## Output Files
 
-After running, you'll find:
+After running, you'll find two top-level folders:
 
-- `picking_list_results.csv` - Main picking list with all stores and products
-- `orderlistor/Orderlista_[Supplier].csv` - Order lists grouped by supplier
-- `picking_list_graphical/Plocklista_[Store].pdf` - Graphical picking lists per store
+### `output/` - what the user opens
+
+- `output/plocklistor/Plocklista_[Store].pdf` - Graphical picking lists per store
+- `output/plocklistor/[Store].xlsx` - Picking list per store (Excel)
+- `output/plocklistor/Plocklistor_sammanställning.xlsx` - Combined picking list (Excel)
+- `output/orderlistor/Orderlista_[Supplier].xlsx` - Order lists grouped by supplier
+
+### `system_data/` - working data the scripts read between steps
+
+- `system_data/plocklistor/[Store].csv` - Per-store picking list (raw CSV)
+- `system_data/plocklistor/picking_list_results.csv` - Combined picking list (raw CSV); read by the PDF step
+- `system_data/orderlistor/Orderlista_[Supplier].csv` - Per-supplier order list (raw CSV)
+
+End users normally only need the files in `output/`. The `system_data/`
+folder exists so the pipeline has a clean place to keep its intermediate
+CSV files without cluttering the user's view.
 
 ## Required Files
 
