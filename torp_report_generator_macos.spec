@@ -11,6 +11,7 @@ a = Analysis(
         ('data/downloads', 'data/downloads'),
         ('data/parametrar/Beställningsfrekvens.csv', 'data'),
         ('data/parametrar/Leveransfrekvens.csv', 'data'),
+        ('data/parametrar/format.xlsx', 'data'),
         ('scripts', 'scripts'),
     ],
     hiddenimports=[

@@ -20,6 +20,7 @@ a = Analysis(
         # <exe-mapp>/data/parametrar/* om dessa finns.
         ('data/parametrar/Beställningsfrekvens.csv', 'data/parametrar'),
         ('data/parametrar/Leveransfrekvens.csv', 'data/parametrar'),
+        ('data/parametrar/format.xlsx', 'data/parametrar'),
         # Hela scripts/-mappen, inklusive _common.py som alla scripts importerar.
         ('scripts', 'scripts'),
     ],
@@ -59,7 +60,28 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['tensorflow', 'tensorflow_core', 'tf', 'keras'],
+    # Uteslut tunga deps som dras in transitivt via Anaconda men som
+    # vi INTE använder. Utan dessa excludes hänger PyInstaller-analysen
+    # i 15+ minuter och produserar en flera GB stor .exe. Vi kör
+    # matplotlib enbart i headless-läge (Agg + PDF) så GUI-backends
+    # är onödiga.
+    excludes=[
+        'tensorflow', 'tensorflow_core', 'tf', 'keras',
+        'PyQt5', 'PyQt6', 'PySide2', 'PySide6',
+        'tkinter', '_tkinter', 'Tkinter',
+        'IPython', 'jupyter', 'jupyter_client', 'jupyter_core',
+        'notebook', 'jupyterlab', 'qtconsole', 'nbconvert', 'nbformat',
+        'ipykernel', 'ipywidgets',
+        'pytest', 'unittest',
+        'sphinx', 'docutils', 'pygments',
+        'sqlalchemy', 'psycopg2', 'MySQLdb', 'pymongo',
+        'cv2', 'PIL.ImageQt', 'PIL.ImageTk',
+        'bokeh', 'holoviews', 'panel', 'altair', 'plotly',
+        'sympy', 'numba',
+        'tables', 'pyarrow',
+        'boto3', 'botocore', 's3transfer',
+        'redis', 'pika',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

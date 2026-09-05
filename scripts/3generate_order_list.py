@@ -5,12 +5,9 @@ Detta script:
 1. Läser beställningsfrekvens från parametrar/Beställningsfrekvens.csv
 2. Hämtar leverantörsinformation från product_sales_items
 3. För varje leverantör, prognostiserar försäljning för beställningsfrekvens-perioden
-4. Skapar en CSV-fil per leverantör i orderlistor/ med:
-   - Alla produkter från leverantören
-   - Prognosticerad försäljning per butik för beställningsfrekvens-perioden
-   - Saldo (lagersaldo)
-   - stock_warning_limit (multiplicerat med antal butiker som säljer produkten)
-   - beställningsbehov (beräknat så att saldo inte går under stock_warning_limit)
+4. Skapar detaljerad orderlista per leverantör i output/orderlistor/
+5. Skapar ren leverantörs-Excel (Kupa kod, produkt, enhet, behov) i
+   output/orderlistor_leverantor/ för verifiering och vidarebefordran
 """
 
 import csv
@@ -22,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from openpyxl.utils import get_column_letter
+    import openpyxl  # noqa: F401
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
@@ -39,21 +36,43 @@ from _common import (
     clear_readonly,
     preflight_writable,
     find_latest_file,
-    load_and_prepare_sales_data,
+    find_item_metadata_file,
+    load_sales_history,
     predict_product_sales,
     normalize_name,
     normalize_name_series,
     count_normalised_changes,
+    filter_active_products,
+    filter_garbage_product_names,
+    deduplicate_stock,
+    assert_not_parameter_path,
+    load_price_log,
+    save_price_log,
+    track_purchase_price,
+    extract_latest_prices_from_items,
+    read_text_with_encoding_fallback,
+    reraise_if_write_locked,
+    load_product_format,
+    sort_dataframe_by_product_format,
+    write_formatted_excel,
+    preflight_torp_excel_files,
 )
 
 PROJECT_ROOT = get_project_root()
 
-# OUTPUT_DIR contains the XLSX files the user opens. SYSTEM_DATA_DIR holds
-# the raw CSV copies for downstream tooling / debugging. Keeping them
-# separate makes "output" cleaner from a user's perspective.
+# OUTPUT_DIR contains the detailed XLSX files the user opens for planning.
+# SUPPLIER_OUTPUT_DIR holds a clean one-file-per-supplier Excel ready to
+# verify and forward without structural edits. SYSTEM_DATA_DIR holds the
+# raw CSV copies for downstream tooling / debugging.
 OUTPUT_DIR = PROJECT_ROOT / 'output' / 'orderlistor'
+SUPPLIER_OUTPUT_DIR = PROJECT_ROOT / 'output' / 'orderlistor_leverantor'
 SYSTEM_DATA_DIR = PROJECT_ROOT / 'system_data' / 'orderlistor'
 DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'
+
+# Inköpspris-loggen ligger på en stabil plats utanför per-leverantörs-
+# katalogerna så den följer med över alla körningar. Loggas historik per
+# product_code så vi kan upptäcka prisförändringar mellan körningar.
+PRICE_LOG_PATH = PROJECT_ROOT / 'system_data' / 'inkopspris_log.json'
 
 BESTALLNINGSFREKVENS_PATH = get_param_file_path('Beställningsfrekvens.csv')
 
@@ -78,12 +97,12 @@ def load_bestallningsfrekvens(file_path):
         return {}
 
     try:
+        text = read_text_with_encoding_fallback(file_path)
         rows = []
-        with open(str(file_path), 'r', encoding='utf-8-sig') as f:
-            reader = csv.reader(f, delimiter=';')
-            for row in reader:
-                rows.append(row)
-    except OSError as e:
+        reader = csv.reader(text.splitlines(), delimiter=';')
+        for row in reader:
+            rows.append(row)
+    except (OSError, UnicodeDecodeError) as e:
         print(
             f"  Varning: Kunde inte läsa {file_path}: {e}\n"
             f"  Använder standardvärde: 7 dagar för alla leverantörer."
@@ -182,8 +201,12 @@ def load_bestallningsfrekvens(file_path):
 
 def load_supplier_mapping(file_path):
     """
-    Läser product_sales_items och returnerar (supplier_mapping, unit_mapping).
-    Båda har nycklar (product_name_lower, store_name).
+    Läser product_sales_items och returnerar
+    (supplier_mapping, unit_mapping, kupa_kod_mapping).
+
+    - supplier_mapping / unit_mapping: nyckel (product_name_lower, store_name)
+    - kupa_kod_mapping: nyckel product_name_lower → supplier_item_code
+      (leverantörens artikelkod / "kupa kod")
     """
     file_path = Path(file_path)
     print(f"\nLäser leverantörsinformation från {file_path}...")
@@ -194,6 +217,9 @@ def load_supplier_mapping(file_path):
 
     supplier_mapping = {}
     unit_mapping = {}
+    kupa_kod_mapping = {}
+
+    has_kupa = 'supplier_item_code' in df.columns
 
     for _, row in df.iterrows():
         if not (pd.notna(row.get('supplier_name')) and pd.notna(row.get('product_name'))):
@@ -210,12 +236,24 @@ def load_supplier_mapping(file_path):
                 unit_mapping[key] = normalize_name(row['unit']) or 'st'
             else:
                 unit_mapping[key] = 'st'
+        if has_kupa and product_name.lower() not in kupa_kod_mapping:
+            raw_kupa = row.get('supplier_item_code')
+            if pd.notna(raw_kupa) and str(raw_kupa).strip() not in ('', 'nan'):
+                kupa_val = str(raw_kupa).strip()
+                # Drop trailing .0 from numeric Excel/CSV floats.
+                if kupa_val.endswith('.0'):
+                    try:
+                        kupa_val = str(int(float(kupa_val)))
+                    except (ValueError, TypeError):
+                        pass
+                kupa_kod_mapping[product_name.lower()] = kupa_val
 
     print(
         f"  Laddade leverantörsmappning för {len(supplier_mapping)} "
         f"produkt-butik-kombinationer"
     )
-    return supplier_mapping, unit_mapping
+    print(f"  Laddade kupa kod för {len(kupa_kod_mapping)} produkter")
+    return supplier_mapping, unit_mapping, kupa_kod_mapping
 
 
 def get_product_unit(product_name, store_name, unit_mapping):
@@ -225,10 +263,18 @@ def get_product_unit(product_name, store_name, unit_mapping):
 
 
 def load_stock_data(file_path):
-    """Läser lagerdata"""
+    """Läser lagerdata och filtrerar bort inaktiva produkter."""
     file_path = Path(file_path)
     print(f"\nLäser lagerdata från {file_path}...")
     stock_df = pd.read_csv(str(file_path))
+
+    # Inaktiva produkter (product_status != 1) ska ignoreras genom hela
+    # pipelinen. Filtrera tidigt så build_stock_index och filter_sales_to_stock
+    # automatiskt utesluter dem från orderlistorna.
+    stock_df = filter_active_products(stock_df)
+
+    # Skräpnamn ('R' etc.) ska aldrig nå orderlistan.
+    stock_df = filter_garbage_product_names(stock_df)
 
     before = len(stock_df)
     stock_df = stock_df.dropna(subset=['product_name', 'store_name'])
@@ -252,6 +298,10 @@ def load_stock_data(file_path):
     stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
     stock_df['stock_warning_limit'] = pd.to_numeric(
         stock_df['stock_warning_limit'], errors='coerce').fillna(0)
+
+    # Slå ihop duplicerade (butik, produktnamn)-rader så orderlistan inte
+    # visar samma produkt flera gånger.
+    stock_df = deduplicate_stock(stock_df)
 
     stock_df['product_name_normalized'] = stock_df['product_name'].str.lower()
     stock_df['stock'] = stock_df['stock'].clip(lower=0)
@@ -393,9 +443,12 @@ def match_supplier_name(supplier_from_mapping, supplier_from_frekvens):
     return None
 
 
-def _write_orderlista(df, csv_path, excel_path):
+def _write_orderlista(df, csv_path, excel_path, product_format=None):
     """Skriv orderlista till CSV + Excel utan read-only-attribut."""
     csv_path = Path(csv_path)
+    assert_not_parameter_path(csv_path)
+    if excel_path is not None:
+        assert_not_parameter_path(excel_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     if csv_path.exists():
         clear_readonly(csv_path)
@@ -406,26 +459,62 @@ def _write_orderlista(df, csv_path, excel_path):
         excel_path = Path(excel_path)
         if excel_path.exists():
             clear_readonly(excel_path)
-        with pd.ExcelWriter(str(excel_path), engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name='Orderlista', index=False)
-            worksheet = writer.sheets['Orderlista']
-            for idx, col in enumerate(df.columns, 1):
-                max_length = max(
-                    df[col].astype(str).map(len).max(),
-                    len(str(col)),
-                )
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
-        clear_readonly(excel_path)
+        try:
+            write_formatted_excel(
+                df, excel_path, 'Orderlista', product_format, product_col='Produktnamn',
+            )
+            clear_readonly(excel_path)
+        except OSError as e:
+            reraise_if_write_locked(excel_path, e)
 
 
-def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestallningsfrekvenser):
+def _build_name_to_code_map(sales_df):
+    """{produktnamn → product_code} från sales_df, för uppslag i pris-loggen.
+
+    Om samma produktnamn har flera koder vinner den nyaste sales-raden
+    (sort_values descending på timestamp innan drop_duplicates).
+
+    Note: load_and_prepare_sales_data renames the items file's
+    ``created_at`` to ``updated``, so we look for either name to stay
+    compatible with raw items dumps and the standardised pipeline data.
+    Previously we only checked for ``created_at`` and silently fell
+    through to "no time sort" - which meant the dedup kept an arbitrary
+    code instead of the most recent one when a product had been
+    re-coded over time.
+    """
+    if 'product_code' not in sales_df.columns or 'name' not in sales_df.columns:
+        return {}
+    df = sales_df[['name', 'product_code']].copy()
+    timestamp_col = next(
+        (c for c in ('updated', 'created_at', 'date') if c in sales_df.columns),
+        None,
+    )
+    if timestamp_col is not None:
+        df['_dt'] = pd.to_datetime(sales_df[timestamp_col], errors='coerce')
+        df = df.sort_values('_dt', ascending=False)
+    df = df.dropna(subset=['name', 'product_code'])
+    df = df.drop_duplicates(subset=['name'], keep='first')
+    return dict(zip(df['name'], df['product_code']))
+
+
+def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
+                     bestallningsfrekvenser, latest_prices=None,
+                     price_log=None, product_format=None,
+                     kupa_kod_mapping=None):
     print("\n" + "=" * 80)
     print("GENERERAR ORDERLISTOR PER LEVERANTÖR")
     print("=" * 80)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SUPPLIER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    preflight_writable(SUPPLIER_OUTPUT_DIR)
+
+    latest_prices = latest_prices or {}
+    price_log = price_log if price_log is not None else {'products': {}}
+    kupa_kod_mapping = kupa_kod_mapping or {}
+    name_to_code = _build_name_to_code_map(sales_df)
+    price_changes = []
 
     supplier_products = {}
     for product_name in sales_df['name'].unique():
@@ -535,17 +624,73 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
             )
 
             aggregated['Orderfrekvens_dagar'] = order_frequency
-            aggregated = aggregated.sort_values('beställningsbehov', ascending=False)
+
+            # Lägg till kolumnen senast_kända_inköpspris per produkt.
+            # Logiken: läs aktuellt pris från items om finns, jämför mot
+            # vad loggen säger sedan tidigare, uppdatera loggen om priset
+            # ändrats. Fallback-ordning vid saknat aktuellt pris: senaste
+            # värdet i loggen, annars tomt.
+            from _common import _normalise_product_code as _norm_code
+            prices_for_orderlista = []
+            for _, row in aggregated.iterrows():
+                prod_name = row['Produktnamn']
+                code = name_to_code.get(prod_name)
+                code_key = _norm_code(code) if code is not None else None
+                current_price = latest_prices.get(code_key) if code_key else None
+                price, changed = track_purchase_price(
+                    price_log, code, prod_name, current_price
+                )
+                prices_for_orderlista.append(price)
+                if changed and code_key:
+                    price_changes.append({
+                        'product_code': code_key,
+                        'product_name': prod_name,
+                        'supplier': supplier_name,
+                        'new_price': price,
+                    })
+            aggregated['senast_kända_inköpspris'] = prices_for_orderlista
+
+            def _produktkod(name):
+                code = _norm_code(name_to_code.get(name))
+                if code:
+                    return code
+                if product_format is not None:
+                    for entry in product_format.entries:
+                        if entry['norm'] == normalize_name(name).lower() and entry.get('code'):
+                            return entry['code']
+                return ''
+
+            aggregated['Produktkod'] = aggregated['Produktnamn'].map(_produktkod)
+            aggregated['Kupa kod'] = aggregated['Produktnamn'].map(
+                lambda n: kupa_kod_mapping.get(normalize_name(n).lower(), '')
+            )
+
+            def _qty_per_box(name):
+                if product_format is None:
+                    return ''
+                return product_format.qty_per_box_by_norm.get(
+                    normalize_name(name).lower(), ''
+                )
+
+            aggregated['Mängd per låda'] = aggregated['Produktnamn'].map(_qty_per_box)
+
+            aggregated = sort_dataframe_by_product_format(
+                aggregated, product_format, 'Produktnamn',
+            )
 
             column_order = [
+                'Kupa kod',
+                'Produktkod',
                 'Produktnamn',
                 'Enhet',
+                'Mängd per låda',
                 'Orderfrekvens_dagar',
                 'Prognosticerad_försäljning',
                 'Saldo',
                 'stock_warning_limit',
                 'Antal_butiker',
                 'beställningsbehov',
+                'senast_kända_inköpspris',
                 'Butik',
             ]
             available_columns = [c for c in column_order if c in aggregated.columns]
@@ -555,6 +700,10 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
                         'Saldo', 'stock_warning_limit'):
                 if col in aggregated.columns:
                     aggregated[col] = aggregated[col].round(1)
+            if 'senast_kända_inköpspris' in aggregated.columns:
+                aggregated['senast_kända_inköpspris'] = pd.to_numeric(
+                    aggregated['senast_kända_inköpspris'], errors='coerce'
+                ).round(2)
 
             safe_supplier_name = safe_filename(supplier_name)
             # CSV → system_data (intern systemdata). XLSX → output (för användaren).
@@ -564,7 +713,41 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
                 if OPENPYXL_AVAILABLE else None
             )
 
-            _write_orderlista(aggregated, output_file_csv, output_file_xlsx)
+            _write_orderlista(aggregated, output_file_csv, output_file_xlsx,
+                              product_format=product_format)
+
+            # Leverantörsfil: ren Excel utan interna planeringskolumner,
+            # avsedd att verifieras och vidarebefordras som den är.
+            if OPENPYXL_AVAILABLE:
+                supplier_cols = [
+                    c for c in (
+                        'Kupa kod',
+                        'Produktkod',
+                        'Produktnamn',
+                        'Enhet',
+                        'Mängd per låda',
+                        'beställningsbehov',
+                    )
+                    if c in aggregated.columns
+                ]
+                supplier_df = aggregated[supplier_cols].copy()
+                # Visa bara rader som faktiskt ska beställas.
+                if 'beställningsbehov' in supplier_df.columns:
+                    supplier_df = supplier_df[
+                        pd.to_numeric(
+                            supplier_df['beställningsbehov'], errors='coerce'
+                        ).fillna(0) > 0
+                    ].copy()
+                supplier_xlsx = (
+                    SUPPLIER_OUTPUT_DIR / f'Orderlista_{safe_supplier_name}.xlsx'
+                )
+                _write_orderlista(
+                    supplier_df,
+                    SYSTEM_DATA_DIR / f'Orderlista_{safe_supplier_name}_leverantor.csv',
+                    supplier_xlsx,
+                    product_format=product_format,
+                )
+                print(f"  [OK] Sparade leverantörs-Excel: {supplier_xlsx}")
 
             print(
                 f"  [OK] Sparade orderlista med {len(aggregated)} produkter "
@@ -582,7 +765,8 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
             # En enskild leverantörs fel ska inte stoppa resten av rapporten.
             import traceback
             print(f"  [WARNING] Kunde inte generera orderlista för {supplier_name}: {e}")
-            traceback.print_exc()
+            if not isinstance(e, PermissionError):
+                traceback.print_exc()
             failed.append((supplier_name, str(e)))
 
     print(f"\n{'=' * 80}")
@@ -592,6 +776,7 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestal
         for name, err in failed:
             print(f"  - {name}: {err}")
     print(f"{'=' * 80}")
+    return price_changes
 
 
 def main():
@@ -601,34 +786,88 @@ def main():
     print(f"Datum: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SUPPLIER_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     BESTALLNINGSFREKVENS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     preflight_writable(OUTPUT_DIR)
+    preflight_writable(SUPPLIER_OUTPUT_DIR)
     preflight_writable(SYSTEM_DATA_DIR)
+    preflight_torp_excel_files(PROJECT_ROOT)
 
     print("\nHittar senaste datafiler...")
-    latest_sales_file = find_latest_file('product_sales_*.csv', DATA_DOWNLOADS_DIR)
     latest_stock_file = find_latest_file('stock_report_*.csv', DATA_DOWNLOADS_DIR)
-    latest_items_file = find_latest_file('product_sales_items_*.csv', DATA_DOWNLOADS_DIR)
+    # Items-filen från SFTP är ibland tom (bara header, ~200 byte) eller
+    # saknas helt. find_item_metadata_file faller då tillbaka på senaste
+    # dagliga product_sales_*.csv (samma item-schema) istället för att
+    # avbryta hela körningen - leverantörsmappning/priser finns även där.
+    latest_items_file = find_item_metadata_file(
+        DATA_DOWNLOADS_DIR, min_size_bytes=1024
+    )
 
     bestallningsfrekvenser = load_bestallningsfrekvens(BESTALLNINGSFREKVENS_PATH)
-    supplier_mapping, unit_mapping = load_supplier_mapping(latest_items_file)
+    supplier_mapping, unit_mapping, kupa_kod_mapping = load_supplier_mapping(
+        latest_items_file
+    )
 
-    sales_df = load_and_prepare_sales_data(latest_sales_file, keep_unit=True)
+    # Use full historical sales for forecasting. The earlier one-day
+    # snapshot (product_sales_<today>.csv) made predict_product_sales
+    # collapse to ~0 for almost every product, which in turn made
+    # beställningsbehov disappear from the order lists.
+    print("\nLäser försäljningshistorik (items-fil + senaste dagliga snapshots)...")
+    sales_df = load_sales_history(DATA_DOWNLOADS_DIR, keep_unit=True)
     stock_df = load_stock_data(latest_stock_file)
 
     sales_df = filter_sales_to_stock(sales_df, stock_df)
     supplier_mapping = filter_mapping_to_stock(supplier_mapping, stock_df)
     unit_mapping = filter_mapping_to_stock(unit_mapping, stock_df)
 
-    process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping, bestallningsfrekvenser)
+    # Inköpspris-tracking: läs senaste priser från items, jämför mot
+    # tidigare körningars logg, uppdatera och spara. Crash-safe - om
+    # filen saknas eller är trasig fortsätter pipelinen med tomma värden.
+    print(f"\nLäser inköpsprislogg från: {PRICE_LOG_PATH}")
+    price_log = load_price_log(PRICE_LOG_PATH)
+    try:
+        items_df_for_prices = pd.read_csv(str(latest_items_file))
+    except (OSError, pd.errors.EmptyDataError, pd.errors.ParserError) as e:
+        print(
+            f"  [VARNING] Kunde inte läsa priser från {latest_items_file}: {e}\n"
+            f"           Använder fallback från loggen om finns."
+        )
+        items_df_for_prices = pd.DataFrame()
+    latest_prices = extract_latest_prices_from_items(items_df_for_prices)
+    print(f"  Aktuella priser från items: {len(latest_prices)} produkter")
+    print(f"  Tidigare loggade produkter: {len(price_log.get('products', {}))}")
+
+    product_format = load_product_format()
+    if product_format is None:
+        print("  [INFO] Ingen format.xlsx hittades – orderlistor sorteras utan produktformat")
+
+    price_changes = process_suppliers(
+        sales_df, stock_df, supplier_mapping, unit_mapping,
+        bestallningsfrekvenser,
+        latest_prices=latest_prices, price_log=price_log,
+        product_format=product_format,
+        kupa_kod_mapping=kupa_kod_mapping,
+    ) or []
+
+    save_price_log(price_log, PRICE_LOG_PATH)
+    if price_changes:
+        print(f"\n[INFO] {len(price_changes)} prisförändring(ar) loggade denna körning:")
+        for ch in price_changes[:10]:
+            print(
+                f"  - {ch['product_name']!r} ({ch['supplier']!r}): "
+                f"nytt pris {ch['new_price']}"
+            )
+        if len(price_changes) > 10:
+            print(f"  ... och {len(price_changes) - 10} till (se {PRICE_LOG_PATH})")
 
     print(f"\n{'=' * 80}")
     print("KLAR!")
     print(f"{'=' * 80}")
     print(f"Excel-orderlistor (för användare) sparade i: {OUTPUT_DIR}/")
+    print(f"Leverantörs-Excel (att vidarebefordra) sparade i: {SUPPLIER_OUTPUT_DIR}/")
     print(f"CSV-orderlistor (systemdata) sparade i:     {SYSTEM_DATA_DIR}/")
 
 

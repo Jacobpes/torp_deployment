@@ -22,6 +22,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+# Tvinga headless Agg-backend INNAN pyplot importeras. Annars försöker
+# matplotlib hitta ett GUI-backend (TkAgg/Qt5Agg) som inte är bundlat
+# i .exe:n och scriptet kraschar med ImportError.
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
@@ -36,14 +41,15 @@ from _common import (
     clear_readonly,
     preflight_writable,
     atomic_copy_with_retry,
-    find_latest_file,
     load_leveransfrekvens,
-    load_and_prepare_sales_data,
+    load_sales_history,
     predict_weekly_sales,
     normalize_name,
     normalize_name_series,
     count_normalised_changes,
     safe_unlink,
+    load_product_format,
+    sort_dataframe_by_product_format,
 )
 
 
@@ -494,7 +500,7 @@ def _build_pdf_for_store(store_name, store_products, sales_df, tmp_pdf_path):
     return pages_written
 
 
-def generate_graphical_picking_list(picking_list_df, sales_df):
+def generate_graphical_picking_list(picking_list_df, sales_df, product_format=None):
     """
     Genererar grafiska PDF:er för varje butik.
 
@@ -519,16 +525,8 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
                 picking_list_df['store_name'] == store_name
             ].copy()
 
-            if 'Påfyllningsbehov' in store_products.columns:
-                store_products['needs_refill'] = store_products['Påfyllningsbehov'] > 0
-            else:
-                store_products['needs_refill'] = False
-
-            sort_cols = ['needs_refill']
-            if 'Påfyllningsbehov' in store_products.columns:
-                sort_cols.append('Påfyllningsbehov')
-            store_products = store_products.sort_values(
-                sort_cols, ascending=[False] * len(sort_cols)
+            store_products = sort_dataframe_by_product_format(
+                store_products, product_format, 'Produktnamn',
             )
 
             safe_store_name = safe_filename(store_name)
@@ -554,7 +552,8 @@ def generate_graphical_picking_list(picking_list_df, sales_df):
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             print(f"  [WARNING] Kunde inte generera PDF för {store_name}: {err_msg}")
-            traceback.print_exc()
+            if not isinstance(e, PermissionError):
+                traceback.print_exc()
             failed.append((store_name, err_msg))
             continue
 
@@ -584,9 +583,6 @@ def main():
     LEVERANSFREKVENS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     preflight_writable(OUTPUT_DIR)
-
-    print("\nHittar senaste försäljningsfil...")
-    latest_sales_file = find_latest_file('product_sales_*.csv', DATA_DOWNLOADS_DIR)
 
     # Leveransfrekvenser läses för loggning / framtida bruk; själva
     # plocklistan har redan Leveransfrekvens_dagar per rad från skript 2.
@@ -635,9 +631,20 @@ def main():
     print(f"  Laddat {len(picking_list_df)} produkter")
     print(f"  Butiker: {picking_list_df['store_name'].nunique()}")
 
-    sales_df = load_and_prepare_sales_data(latest_sales_file, keep_unit=True)
+    # Historiken som ritas i PDF:erna kräver hela tidsserien, inte bara
+    # senaste dagens snapshot. Tidigare användes product_sales_*.csv,
+    # vilket bara innehåller en dags transaktioner (~500 rader) och då
+    # blev grafens "senaste 52 veckor" i praktiken bara den innevarande
+    # veckan med nollor överallt annars. Vi tar nu hela cumulative
+    # items-filen som primär källa och kompletterar med eventuella
+    # dagliga snapshots för datum efter items-filens slutdatum så att
+    # även de senaste dagarna kommer med (items-exporten på SFTP:n
+    # ligger ofta 1-3 dygn efter dagliga snapshots).
+    print("\nLäser försäljningshistorik (items-fil + senaste dagliga snapshots)...")
+    sales_df = load_sales_history(DATA_DOWNLOADS_DIR, keep_unit=True)
 
-    generate_graphical_picking_list(picking_list_df, sales_df)
+    product_format = load_product_format()
+    generate_graphical_picking_list(picking_list_df, sales_df, product_format=product_format)
 
     print(f"\n{'=' * 80}")
     print("KLAR!")

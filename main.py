@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Main orchestrator script that:
-1. Downloads data from SFTP server
-2. Generates picking lists
-3. Generates order lists per supplier
-4. Generates graphical picking lists
+1. Closes open Excel files (so format.xlsx / output can be written)
+2. Downloads data from SFTP server
+3. Generates picking lists
+4. Generates order lists per supplier
+5. Generates graphical picking lists
 
 This script can be packaged as a Windows executable.
 """
@@ -30,6 +31,16 @@ else:
 scripts_dir = script_dir / 'scripts'
 sys.path.insert(0, str(script_dir))
 sys.path.insert(0, str(scripts_dir))
+# When frozen, scripts (including _common.py) live under PyInstaller's
+# extract dir (_MEIPASS), not next to the .exe. Put that on sys.path so
+# "from _common import ..." works in main() and in run_script.
+if getattr(sys, 'frozen', False):
+    _meipass = getattr(sys, '_MEIPASS', None)
+    if _meipass:
+        _bundled_scripts = Path(_meipass) / 'scripts'
+        if _bundled_scripts.is_dir():
+            sys.path.insert(0, str(_bundled_scripts))
+        sys.path.insert(0, str(_meipass))
 
 # Change to script directory to ensure relative paths work
 # This ensures all files are saved in the same folder as .exe
@@ -196,12 +207,21 @@ def run_script(script_path, description):
     else:
         # When running as normal Python script, use subprocess
         try:
+            # Force UTF-8 stdio in child processes so åäö and other
+            # non-ASCII output never crashes on a default cp1252 Windows
+            # console. Without this the child inherits the parent's
+            # process-level encoding, which is cp1252 by default on
+            # Swedish/Finnish Windows.
+            child_env = os.environ.copy()
+            child_env['PYTHONIOENCODING'] = 'utf-8'
+            child_env['PYTHONUTF8'] = '1'
             result = subprocess.run(
                 [sys.executable, str(actual_path)],
                 cwd=str(script_dir),
                 check=True,
                 capture_output=False,
-                text=True
+                text=True,
+                env=child_env,
             )
             main_logger.info(f"\n[OK] Successfully completed: {description}")
             return True
@@ -226,12 +246,12 @@ def run_script(script_path, description):
                 error_logger.error(tb_str)
                 return False
         except subprocess.CalledProcessError as e:
-            error_msg = f"\n✗ Error running {description}: {e}"
+            error_msg = f"\n[ERROR] Error running {description}: {e}"
             main_logger.error(error_msg)
             error_logger.error(error_msg)
             return False
         except Exception as e:
-            error_msg = f"\n✗ Unexpected error running {description}: {e}"
+            error_msg = f"\n[ERROR] Unexpected error running {description}: {e}"
             main_logger.error(error_msg)
             error_logger.error(error_msg)
             import traceback
@@ -250,9 +270,35 @@ def main():
     main_logger.info(f"Log file: {LOG_FILE}")
     main_logger.info(f"Error log file: {ERROR_LOG_FILE}")
     main_logger.info("="*80)
-    
-    # Step 1: Download data from SFTP
-    print_header("STEP 1: Downloading data from SFTP server")
+
+    # Prefer bundled scripts when frozen; fall back to next-to-exe scripts/.
+    _common_paths = []
+    if getattr(sys, 'frozen', False):
+        _meipass = getattr(sys, '_MEIPASS', None)
+        if _meipass:
+            _common_paths.append(Path(_meipass) / 'scripts')
+            _common_paths.append(Path(_meipass))
+    _common_paths.append(scripts_dir)
+    for _p in _common_paths:
+        if _p.is_dir() and str(_p) not in sys.path:
+            sys.path.insert(0, str(_p))
+    from _common import close_all_excel_applications, preflight_torp_excel_files
+
+    # Step 1: Close Excel so parameter/output .xlsx files are not locked.
+    print_header("STEP 1: Closing open Excel files")
+    try:
+        close_all_excel_applications()
+        main_logger.info("Excel-processer stängda (eller ingen Excel körde).")
+    except Exception as e:
+        warning_msg = (
+            f"\nWARNING: Kunde inte stänga Excel automatiskt: {e}\n"
+            f"Fortsätter, men låsta filer kan fortfarande stoppa körningen."
+        )
+        main_logger.warning(warning_msg)
+        error_logger.warning(warning_msg)
+
+    # Step 2: Download data from SFTP
+    print_header("STEP 2: Downloading data from SFTP server")
     download_script = Path('scripts/1download.py')
     
     success = run_script(download_script, "Download data from SFTP")
@@ -260,9 +306,19 @@ def main():
         warning_msg = "\nWARNING: Download failed or script not found.\nContinuing with existing data files...\n(This is OK if you're using pre-downloaded data)"
         main_logger.warning(warning_msg)
         error_logger.warning(warning_msg)
+
+    # Fail fast if Torp Excel files are still locked after the close attempt.
+    try:
+        preflight_torp_excel_files(script_dir)
+        main_logger.info("Excel-filer (format.xlsx / output) är inte låsta – fortsätter.")
+    except PermissionError as e:
+        error_msg = f"\n{e}"
+        main_logger.error(error_msg)
+        error_logger.error(error_msg)
+        return False
     
-    # Step 2: Generate picking list
-    print_header("STEP 2: Generating picking list")
+    # Step 3: Generate picking list
+    print_header("STEP 3: Generating picking list")
     picking_script = Path('scripts/2generate_picking_list.py')
     success = run_script(picking_script, "Generate picking list")
     if not success:
@@ -271,8 +327,8 @@ def main():
         error_logger.error(error_msg)
         return False
     
-    # Step 3: Generate order lists per supplier
-    print_header("STEP 3: Generating order lists per supplier")
+    # Step 4: Generate order lists per supplier
+    print_header("STEP 4: Generating order lists per supplier")
     order_script = Path('scripts/3generate_order_list.py')
     success = run_script(order_script, "Generate order lists per supplier")
     if not success:
@@ -280,8 +336,8 @@ def main():
         main_logger.warning(warning_msg)
         error_logger.warning(warning_msg)
     
-    # Step 4: Generate graphical picking lists
-    print_header("STEP 4: Generating graphical picking lists")
+    # Step 5: Generate graphical picking lists
+    print_header("STEP 5: Generating graphical picking lists")
     graphical_script = Path('scripts/4generate_graphical_picking_list.py')
     success = run_script(graphical_script, "Generate graphical picking lists")
     if not success:
@@ -299,6 +355,9 @@ def main():
     main_logger.info("  User-facing reports (output/):")
     main_logger.info(f"    - Picking lists (XLSX + PDF): {script_dir / 'output' / 'plocklistor'}")
     main_logger.info(f"    - Order lists (XLSX):         {script_dir / 'output' / 'orderlistor'}")
+    main_logger.info(
+        f"    - Order lists for suppliers: {script_dir / 'output' / 'orderlistor_leverantor'}"
+    )
     main_logger.info("  System data (system_data/) - working CSV files:")
     main_logger.info(f"    - Picking list CSVs: {script_dir / 'system_data' / 'plocklistor'}")
     main_logger.info(f"    - Order list CSVs:   {script_dir / 'system_data' / 'orderlistor'}")

@@ -5,6 +5,8 @@ Downloads all files from the remote server to the local data/downloads directory
 """
 
 import os
+import re
+import shutil
 import sys
 import stat
 import paramiko
@@ -18,25 +20,76 @@ SSH_KEY_PATH = "../id_ed25519"  # Relative to scripts/ directory
 LOCAL_DOWNLOAD_PATH = "../data/downloads"  # Relative to scripts/ directory
 
 
-def download_files():
-    """Connect to SFTP server and download all files."""
-    
-    # Get absolute paths
-    # When running as executable, __file__ points to temp directory
-    # Use sys.executable to find where .exe is located (same as main.py)
+def _project_paths():
+    """Return (project_root, download_dir, stock_history_dir).
+
+    Hanterar både scriptkörning och PyInstaller-bundle (sys.frozen).
+    """
     if getattr(sys, 'frozen', False):
-        # Running as executable - use sys.executable to find where .exe file is located
         project_root = Path(sys.executable).parent.resolve()
-        # Save downloads in data/nedladdningar subdirectory
         download_dir = project_root / 'data' / 'nedladdningar'
     else:
-        # Running as script - use script directory and go up to project root
         script_dir = Path(__file__).parent
-        if script_dir.name == 'scripts':
-            project_root = script_dir.parent
-        else:
-            project_root = script_dir
+        project_root = (script_dir.parent if script_dir.name == 'scripts'
+                        else script_dir)
         download_dir = (project_root / 'data' / 'nedladdningar').resolve()
+    stock_history_dir = project_root / 'system_data' / 'stock_history'
+    return project_root, download_dir, stock_history_dir
+
+
+def archive_stock_reports(download_dir, stock_history_dir):
+    """
+    Kopiera alla stock_report_*.csv från download_dir till
+    stock_history_dir så vi bygger upp en saldo-historik över tid.
+
+    Detta är grunden för att ML-träningen ska kunna se historiskt saldo
+    och behandla "0 försäljning vid 0 lager" som ett missing-data-fall
+    snarare än ett genuint "låg efterfrågan"-signal.
+
+    Idempotent: om filen redan finns i arkivet hoppar vi över den
+    (skriver inte över - första kopian vinner, då den motsvarar
+    snapshotten det datumet faktiskt togs).
+    """
+    stock_history_dir.mkdir(parents=True, exist_ok=True)
+    stock_files = sorted(download_dir.glob('stock_report_*.csv'))
+    if not stock_files:
+        print("[ARCHIVE] Inga stock_report-filer att arkivera.")
+        return
+
+    archived = 0
+    skipped = 0
+    failed = 0
+    for src in stock_files:
+        # Validera filnamn så vi inte arkiverar konstig filer.
+        if not re.match(r'^stock_report_\d{4}-\d{2}-\d{2}\.csv$', src.name):
+            continue
+        dest = stock_history_dir / src.name
+        if dest.exists():
+            skipped += 1
+            continue
+        try:
+            shutil.copy2(str(src), str(dest))
+            archived += 1
+        except OSError as e:
+            print(f"  [WARNING] Could not archive {src.name}: {e}")
+            failed += 1
+
+    msg_parts = []
+    if archived:
+        msg_parts.append(f"{archived} nya")
+    if skipped:
+        msg_parts.append(f"{skipped} redan arkiverade")
+    if failed:
+        msg_parts.append(f"{failed} misslyckades")
+    print(
+        f"[ARCHIVE] Stock-historik: {', '.join(msg_parts) if msg_parts else 'inget att göra'} "
+        f"({stock_history_dir})"
+    )
+
+
+def download_files():
+    """Connect to SFTP server and download all files."""
+    project_root, download_dir, stock_history_dir = _project_paths()
     
     key_path = (project_root / 'id_ed25519').resolve()
     
@@ -125,9 +178,11 @@ def download_files():
             try:
                 sftp.get(filename, str(local_file))
                 downloaded_count += 1
-                print(f"  ✓ Saved to: {local_file}")
+                print(f"  [OK] Saved to: {local_file}")
             except Exception as e:
-                print(f"  ✗ Error downloading {filename}: {e}")
+                # Plain ASCII tags so the Windows cp1252 console doesn't
+                # crash trying to render checkmarks/cross glyphs.
+                print(f"  [FAIL] Error downloading {filename}: {e}")
         
         print(f"\n{'='*60}")
         print(f"Download complete! {downloaded_count} file(s) downloaded.")
@@ -137,6 +192,12 @@ def download_files():
         # Close connections
         sftp.close()
         transport.close()
+
+        # Arkivera stock_report-snapshots så vi bygger saldohistorik
+        # framåt (gör efter download lyckats men före några andra
+        # exceptions kan hända). Idempotent - kör utan biverkningar
+        # även om man kör download.py flera gånger samma dag.
+        archive_stock_reports(download_dir, stock_history_dir)
         
     except paramiko.ssh_exception.SSHException as e:
         print(f"SSH Error: {e}")

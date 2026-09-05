@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 
 try:
-    from openpyxl.utils import get_column_letter
+    import openpyxl  # noqa: F401
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
@@ -34,12 +34,23 @@ from _common import (
     clear_readonly,
     preflight_writable,
     find_latest_file,
+    find_item_metadata_file,
     load_leveransfrekvens,
-    load_and_prepare_sales_data,
+    load_sales_history,
     predict_product_sales,
     normalize_name,
     normalize_name_series,
     count_normalised_changes,
+    filter_active_products,
+    filter_garbage_product_names,
+    deduplicate_stock,
+    assert_not_parameter_path,
+    reraise_if_write_locked,
+    load_and_sync_product_format,
+    sort_dataframe_by_product_format,
+    sort_dataframe_by_store_and_format,
+    write_formatted_excel,
+    preflight_torp_excel_files,
 )
 
 PROJECT_ROOT = get_project_root()
@@ -54,6 +65,12 @@ DATA_DOWNLOADS_DIR = PROJECT_ROOT / 'data' / 'nedladdningar'
 
 PICKING_LIST_RESULTS_PATH = SYSTEM_DATA_DIR / 'picking_list_results.csv'
 PICKING_LIST_SUMMARY_XLSX = OUTPUT_DIR / 'Plocklistor_sammanställning.xlsx'
+
+# Avancerad plocklista: INKLUDERAR rader med Påfyllningsbehov <= 0 så
+# användaren kan se vilka produkter som har överskott (negativa värden) i
+# olika butiker - användbart för att bestämma omfördelningar mellan butiker.
+ADVANCED_PICKING_LIST_XLSX = OUTPUT_DIR / 'avancerad_plocklista.xlsx'
+ADVANCED_PICKING_LIST_CSV = SYSTEM_DATA_DIR / 'avancerad_plocklista.csv'
 
 # Exakta kolumner och ordning för plocklistor enligt
 # data/template/picking_list_results.xlsx. Alla output-filer (per-butik
@@ -87,10 +104,20 @@ LEVERANSFREKVENS_PATH = get_param_file_path('Leveransfrekvens.csv')
 
 
 def load_stock_data(file_path):
-    """Läser lagerdata"""
+    """Läser lagerdata och filtrerar bort inaktiva produkter."""
     file_path = Path(file_path)
     print(f"\nLäser lagerdata från {file_path}...")
     stock_df = pd.read_csv(str(file_path))
+
+    # Inaktiva produkter (product_status != 1) ska ignoreras genom hela
+    # pipelinen. Görs här innan något annat filter byggs så att alla
+    # nedströms steg (filter_sales_to_stock, build_stock_index, ...)
+    # automatiskt arbetar mot endast aktiva produkter.
+    stock_df = filter_active_products(stock_df)
+
+    # Skräpnamn (t.ex. en produkt som heter bara "R") ska aldrig nå
+    # plocklistan. Filtreras tidigt så hela pipelinen slipper se dem.
+    stock_df = filter_garbage_product_names(stock_df)
 
     before = len(stock_df)
     stock_df = stock_df.dropna(subset=['product_name', 'store_name'])
@@ -115,6 +142,11 @@ def load_stock_data(file_path):
     stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
     stock_df['stock_warning_limit'] = pd.to_numeric(
         stock_df['stock_warning_limit'], errors='coerce').fillna(0)
+
+    # Slå ihop duplicerade (butik, produktnamn)-rader så plocklistan inte
+    # visar samma produkt flera gånger. Görs efter numeric coerce så att
+    # SUM-aggregeringen får riktiga floats.
+    stock_df = deduplicate_stock(stock_df)
 
     stock_df['product_name_normalized'] = stock_df['product_name'].str.lower()
     stock_df['store_name_normalized'] = stock_df['store_name']
@@ -249,13 +281,17 @@ def get_product_unit(product_name, store_name, unit_mapping):
     return unit_mapping.get(key, 'st')
 
 
-def _write_dataframe(df, csv_path, excel_path=None, sheet_name='Plocklista'):
+def _write_dataframe(df, csv_path, excel_path=None, sheet_name='Plocklista',
+                     product_format=None):
     """
     Skriver DataFrame till CSV och (om openpyxl är tillgängligt) Excel,
     rensar read-only-attributet på filerna så att alla användare kan
-    redigera dem.
+    redigera dem. Excel-filer får produktnamn-färger enligt format.xlsx.
     """
     csv_path = Path(csv_path)
+    assert_not_parameter_path(csv_path)
+    if excel_path is not None:
+        assert_not_parameter_path(excel_path)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     if csv_path.exists():
         clear_readonly(csv_path)
@@ -266,24 +302,75 @@ def _write_dataframe(df, csv_path, excel_path=None, sheet_name='Plocklista'):
         excel_path = Path(excel_path)
         if excel_path.exists():
             clear_readonly(excel_path)
-        with pd.ExcelWriter(str(excel_path), engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-            worksheet = writer.sheets[sheet_name]
-            for idx, col in enumerate(df.columns, 1):
-                max_length = max(
-                    df[col].astype(str).map(len).max(),
-                    len(str(col)),
-                )
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[get_column_letter(idx)].width = adjusted_width
-        clear_readonly(excel_path)
+        try:
+            write_formatted_excel(
+                df, excel_path, sheet_name, product_format, product_col='Produktnamn',
+            )
+            clear_readonly(excel_path)
+        except OSError as e:
+            reraise_if_write_locked(excel_path, e)
 
 
-def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
+def _normalise_product_code(product_code):
+    """Format a stock_report product_code as a clean integer string when possible."""
+    if not pd.notna(product_code) or product_code == '':
+        return ''
+    try:
+        return str(int(float(product_code)))
+    except (ValueError, TypeError):
+        return str(product_code)
+
+
+def _normalise_product_id(product_id):
+    """Convert stock_report product_id to int; 0 if missing/garbage."""
+    if not pd.notna(product_id):
+        return 0
+    try:
+        return int(float(product_id))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _match_sales_for_product(product_name_normalized, sales_by_product):
     """
-    Processar alla butiker och produkter för att generera plocklista.
-    Sparar en CSV-fil per butik i plocklistor/ mappen.
-    parametrar: dictionary med leveransfrekvens per butik
+    Look up the sales rows for a given normalised product name in this store.
+
+    Two-pass match (mirrors the old sales-first iteration but flipped):
+      1. Exact normalised-lowercase name hit.
+      2. Substring fallback in either direction (handles trailing notes
+         like "Mjölkdryck 3 % Laktosfri 1 L" vs "Mjölkdryck 3% Laktosfri 1L").
+
+    Returns the sales DataFrame slice or None when no sales row exists at
+    all for this product+store pair (treated as predicted_sales=0).
+    """
+    if not sales_by_product:
+        return None
+    hit = sales_by_product.get(product_name_normalized)
+    if hit is not None:
+        return hit
+    for sales_name_norm, group in sales_by_product.items():
+        if (product_name_normalized in sales_name_norm
+                or sales_name_norm in product_name_normalized):
+            return group
+    return None
+
+
+def process_all_stores(sales_df, stock_df, parametrar, unit_mapping,
+                       product_format=None):
+    """
+    Generate the picking list for every (store, product) pair that exists in
+    stock_report. Earlier versions iterated sales-active products only,
+    which silently dropped any product that hadn't sold recently (or any
+    store that hadn't sold at all on the day of the daily snapshot). The
+    user-facing advanced picking list ("avancerad plocklista") explicitly
+    needs ALL products listed so they can be redistributed between stores
+    even when they aren't selling, so this loop now uses stock_report as
+    the canonical universe and looks up sales as an optional input to
+    the forecast.
+
+    For products with no historical sales, predicted_sales = 0 and
+    Påfyllningsbehov = Varningsgräns − saldo_denna_butik (i.e. just
+    "bring stock up to the warning limit").
     """
     print("\n" + "=" * 80)
     print("GENERERAR PROGNOSER OCH PLOCKLISTA")
@@ -292,7 +379,12 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     SYSTEM_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    stores = sales_df['store'].unique()
+    # Use stock_report as the source of truth for stores AND products.
+    # Sorting gives deterministic per-run output ordering and a stable diff
+    # when comparing two days' picking lists side-by-side.
+    stores = sorted(
+        s for s in stock_df['store_name'].unique() if isinstance(s, str)
+    )
     all_results = []
 
     for store_name in stores:
@@ -302,56 +394,54 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
             f"(leveransfrekvens: {delivery_frequency} dagar)"
         )
 
-        store_sales = sales_df[sales_df['store'] == store_name].copy()
         store_stock = stock_df[stock_df['store_name'] == store_name].copy()
+        store_sales = sales_df[sales_df['store'] == store_name].copy()
 
-        stock_lookup = {}
-        for _, row in store_stock.iterrows():
-            product_name = row['product_name']
-            if not isinstance(product_name, str):
+        # Pre-index sales by normalised product name so the per-product
+        # lookup inside the hot loop is O(1) instead of re-filtering
+        # the full sales_df ~500 times per store.
+        sales_by_product = {}
+        for sales_name, group in store_sales.groupby('name', sort=False):
+            if not isinstance(sales_name, str) or not sales_name:
                 continue
-            product_name_normalized = normalize_name(product_name).lower()
-            stock_lookup[product_name_normalized] = {
-                'product_name': product_name,
-                'stock': max(0, row['stock']),
-                'stock_warning_limit': row['stock_warning_limit'],
-                'product_id': row['product_id'],
-                'product_code': row['product_code'],
-            }
+            key = normalize_name(sales_name).lower()
+            if key:
+                sales_by_product[key] = group
 
-        products = store_sales['name'].unique()
-        print(f"  Antal produkter i försäljningsdata: {len(products)}")
+        print(
+            f"  Antal produkter i stock_report: {len(store_stock)} "
+            f"(varav {len(sales_by_product)} med försäljningshistorik)"
+        )
 
         store_results = []
-        skipped_without_stock = 0
-        for product_name in products:
-            if pd.isna(product_name):
+        no_sales_count = 0
+        for _, stock_row in store_stock.iterrows():
+            product_name = stock_row.get('product_name')
+            if not isinstance(product_name, str) or not product_name.strip():
                 continue
-            product_name = str(product_name)
-            product_sales = store_sales[store_sales['name'] == product_name].copy()
-
-            matched_stock = None
             product_name_normalized = normalize_name(product_name).lower()
-            if product_name_normalized in stock_lookup:
-                matched_stock = stock_lookup[product_name_normalized]
-            else:
-                for key, value in stock_lookup.items():
-                    if product_name_normalized in key or key in product_name_normalized:
-                        matched_stock = value
-                        break
 
-            if matched_stock is None:
-                skipped_without_stock += 1
-                continue
+            product_sales = _match_sales_for_product(
+                product_name_normalized, sales_by_product
+            )
 
-            try:
-                predicted_sales = predict_product_sales(product_sales, delivery_frequency)
-            except Exception as e:
-                print(f"    Varning: Kunde inte prognostisera för {product_name}: {e}")
+            if product_sales is None or len(product_sales) == 0:
                 predicted_sales = 0.0
+                no_sales_count += 1
+            else:
+                try:
+                    predicted_sales = predict_product_sales(
+                        product_sales, delivery_frequency
+                    )
+                except Exception as e:
+                    print(
+                        f"    Varning: Kunde inte prognostisera för "
+                        f"{product_name}: {e}"
+                    )
+                    predicted_sales = 0.0
 
-            current_stock = matched_stock['stock']
-            stock_warning_limit = matched_stock['stock_warning_limit']
+            current_stock = max(0.0, float(stock_row.get('stock', 0) or 0))
+            stock_warning_limit = float(stock_row.get('stock_warning_limit', 0) or 0)
 
             fill_up_quantity = calculate_picking_quantity(
                 current_stock,
@@ -361,22 +451,14 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
             )
 
             unit = get_product_unit(product_name, store_name, unit_mapping)
-
-            product_code = matched_stock['product_code']
-            if pd.notna(product_code):
-                try:
-                    product_code = str(int(float(product_code)))
-                except (ValueError, TypeError):
-                    product_code = str(product_code)
-            else:
-                product_code = ''
+            product_code = _normalise_product_code(stock_row.get('product_code'))
+            product_id = _normalise_product_id(stock_row.get('product_id'))
 
             store_results.append({
                 'store_name': store_name,
-                'Produktnamn': matched_stock['product_name'],
+                'Produktnamn': product_name,
                 'Produktkod': product_code,
-                'Produkt_ID': int(float(matched_stock['product_id']))
-                if pd.notna(matched_stock['product_id']) else 0,
+                'Produkt_ID': product_id,
                 'Leveransfrekvens_dagar': delivery_frequency,
                 'saldo_denna_butik': current_stock,
                 'Varningsgräns': stock_warning_limit,
@@ -385,16 +467,18 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
                 'Enhet': unit,
             })
 
-        print(f"  Processade {len(store_results)} produkter med matchande lagerdata")
-        if skipped_without_stock > 0:
+        if no_sales_count > 0:
             print(
-                f"  Hoppade över {skipped_without_stock} produkter "
-                f"utan stock_report-match (betraktade som utgångna)"
+                f"  {no_sales_count} produkter saknar försäljningshistorik "
+                f"(predicted_sales=0; Påfyllningsbehov = Varningsgräns - saldo)"
             )
+        print(f"  Processade {len(store_results)} produkter totalt")
 
         if len(store_results) > 0:
             store_df = pd.DataFrame(store_results)
-            store_df = store_df.sort_values(['Påfyllningsbehov'], ascending=[False])
+            store_df = sort_dataframe_by_product_format(
+                store_df, product_format, 'Produktnamn',
+            )
 
             if 'Produktkod' in store_df.columns:
                 def format_product_code(val):
@@ -422,7 +506,10 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping):
             output_file_xlsx = OUTPUT_DIR / f'{safe_store_name}.xlsx' if OPENPYXL_AVAILABLE else None
 
             try:
-                _write_dataframe(store_df, output_file_csv, output_file_xlsx, sheet_name='Plocklista')
+                _write_dataframe(
+                    store_df, output_file_csv, output_file_xlsx,
+                    sheet_name='Plocklista', product_format=product_format,
+                )
             except PermissionError as e:
                 print(
                     f"  [WARNING] Kunde inte skriva plocklista för {store_name}: {e}\n"
@@ -460,6 +547,7 @@ def main():
     # mid-loop after we've already spent time on forecasting.
     preflight_writable(OUTPUT_DIR)
     preflight_writable(SYSTEM_DATA_DIR)
+    preflight_torp_excel_files(PROJECT_ROOT)
 
     print("\nHittar senaste datafiler...")
     print(f"  Söker i: {DATA_DOWNLOADS_DIR}")
@@ -476,46 +564,64 @@ def main():
             f"Kontrollera att 'data/downloads' katalogen finns i projektets rot."
         )
 
-    latest_sales_file = find_latest_file('product_sales_*.csv', DATA_DOWNLOADS_DIR)
     latest_stock_file = find_latest_file('stock_report_*.csv', DATA_DOWNLOADS_DIR)
-    latest_items_file = find_latest_file('product_sales_items_*.csv', DATA_DOWNLOADS_DIR)
+    # Items-filen från SFTP är ibland tom (bara header, ~200 byte) eller
+    # saknas helt. find_item_metadata_file faller då tillbaka på senaste
+    # dagliga product_sales_*.csv (samma item-schema) istället för att
+    # avbryta hela körningen - enhetsmappningen behöver bara unit-kolumnen.
+    latest_items_file = find_item_metadata_file(
+        DATA_DOWNLOADS_DIR, min_size_bytes=1024
+    )
 
     print(f"\nLaddar leveransfrekvenser från: {LEVERANSFREKVENS_PATH}")
     parametrar = load_leveransfrekvens(LEVERANSFREKVENS_PATH)
 
     unit_mapping = load_unit_mapping(latest_items_file)
 
-    sales_df = load_and_prepare_sales_data(latest_sales_file)
+    # Forecasting needs the full historical sales window, not just the
+    # latest one-day product_sales_*.csv snapshot. With one day's data,
+    # predict_product_sales degenerates to 0 for almost every product
+    # (the 4-week-average baseline has no complete weeks to average), so
+    # we use load_sales_history which stitches the cumulative items file
+    # together with newer daily snapshots.
+    print("\nLäser försäljningshistorik (items-fil + senaste dagliga snapshots)...")
+    sales_df = load_sales_history(DATA_DOWNLOADS_DIR)
     stock_df = load_stock_data(latest_stock_file)
 
     sales_df = filter_sales_to_stock(sales_df, stock_df)
     unit_mapping = filter_unit_mapping_to_stock(unit_mapping, stock_df)
 
-    # Surface stores that have sales data but no entry in Leveransfrekvens.csv.
-    # If the name only differs by whitespace this is where a typo becomes
-    # visible - both names appear in the warning and the user can fix the CSV.
-    sales_stores = set(sales_df['store'].unique())
+    # Surface stores that we'll process (i.e. stores with stock data) but
+    # which lack an entry in Leveransfrekvens.csv. If the name only differs
+    # by whitespace this is where a typo becomes visible - both the stock
+    # name and the config name appear in the warning and the user can fix
+    # the CSV by hand.
+    stock_stores = set(stock_df['store_name'].unique())
     config_stores = set(parametrar.keys())
-    unknown_stores = sorted(sales_stores - config_stores)
+    unknown_stores = sorted(stock_stores - config_stores)
     if unknown_stores:
         print(
-            "\n[INFO] Följande butiker saknas i Leveransfrekvens.csv "
-            "(default 7 dagar används):"
+            "\n[INFO] Följande butiker (från stock_report) saknas i "
+            "Leveransfrekvens.csv (default 7 dagar används):"
         )
         for s in unknown_stores:
             # repr() makes any hidden whitespace visible in the log.
             print(f"  - {s!r}")
-        configured_without_sales = sorted(config_stores - sales_stores)
-        if configured_without_sales:
+        configured_without_stock = sorted(config_stores - stock_stores)
+        if configured_without_stock:
             print(
                 "  (Tips: dessa butiker finns i Leveransfrekvens.csv men "
-                "INTE i försäljningsdata - jämför med listan ovan om "
+                "INTE i stock_report - jämför med listan ovan om "
                 "namnen råkar skilja sig åt i whitespace:)"
             )
-            for s in configured_without_sales:
+            for s in configured_without_stock:
                 print(f"  - {s!r}")
 
-    results = process_all_stores(sales_df, stock_df, parametrar, unit_mapping)
+    product_format = load_and_sync_product_format(stock_df)
+
+    results = process_all_stores(
+        sales_df, stock_df, parametrar, unit_mapping, product_format=product_format,
+    )
 
     print(f"\n{'=' * 80}")
     print("SAMMANFATTNING")
@@ -539,14 +645,36 @@ def main():
             if col in results_df.columns:
                 results_df[col] = results_df[col].round(1)
 
+        # Avancerad plocklista: ALLA rader inkl. överskott (negativa
+        # Påfyllningsbehov). Sorterad så att största behoven är överst
+        # och största överskotten längst ner per butik - underlättar
+        # beslut om omfördelning mellan butiker.
+        advanced_df = results_df.copy()
+        advanced_df = sort_dataframe_by_store_and_format(
+            advanced_df, product_format, 'store_name', 'Produktnamn',
+        )
+        advanced_df = _apply_picking_list_template(advanced_df)
+        advanced_xlsx = ADVANCED_PICKING_LIST_XLSX if OPENPYXL_AVAILABLE else None
+        _write_dataframe(
+            advanced_df, ADVANCED_PICKING_LIST_CSV, advanced_xlsx,
+            sheet_name='Avancerad plocklista', product_format=product_format,
+        )
+        print(
+            f"\n[OK] Sparade avancerad plocklista (alla rader inkl. överskott) "
+            f"med {len(advanced_df)} rader"
+        )
+        if advanced_xlsx is not None:
+            print(f"     Excel: {advanced_xlsx}")
+        print(f"     CSV:   {ADVANCED_PICKING_LIST_CSV}")
+
         # Filtrera sammanställningen till enbart rader med faktiskt
         # påfyllningsbehov (>0). Per-butik-filerna behåller all data
         # (inklusive negativa värden som visar överskott), men den
         # här sammanfattningen är en åtgärdslista - bara det som
         # faktiskt behöver fyllas på.
         results_df = results_df[results_df['Påfyllningsbehov'] > 0].copy()
-        results_df = results_df.sort_values(
-            ['store_name', 'Påfyllningsbehov'], ascending=[True, False]
+        results_df = sort_dataframe_by_store_and_format(
+            results_df, product_format, 'store_name', 'Produktnamn',
         )
 
         print(
@@ -567,13 +695,14 @@ def main():
 
         excel_summary = PICKING_LIST_SUMMARY_XLSX if OPENPYXL_AVAILABLE else None
         _write_dataframe(
-            results_df, PICKING_LIST_RESULTS_PATH, excel_summary, sheet_name='Plocklistor'
+            results_df, PICKING_LIST_RESULTS_PATH, excel_summary,
+            sheet_name='Plocklistor', product_format=product_format,
         )
         print(f"\n[OK] Sparade sammanfattande plocklista (CSV) till: {PICKING_LIST_RESULTS_PATH}")
         if excel_summary is not None:
             print(f"[OK] Sparade Excel-fil: {excel_summary}")
 
-        stores_processed = sales_df['store'].nunique()
+        stores_processed = stock_df['store_name'].nunique()
         print(f"\nAntal butiker processade: {stores_processed}")
         print(f"Excel-plocklistor (för användare) sparade i: {OUTPUT_DIR}/")
         print(f"CSV-plocklistor (systemdata) sparade i:     {SYSTEM_DATA_DIR}/")
