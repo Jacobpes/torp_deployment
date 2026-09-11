@@ -154,19 +154,15 @@ def _cell_font_color_hex(cell):
 
 
 class ProductFormatConfig:
-    """Product order, name colours and qty-per-box from format.xlsx."""
+    """Product order and name colours from format.xlsx."""
 
     def __init__(self, entries):
         self.entries = entries
         self.order_index = {e['norm']: i for i, e in enumerate(entries)}
         self.color_by_norm = {e['norm']: e['color'] for e in entries}
-        self.qty_per_box_by_norm = {
-            e['norm']: e.get('qty_per_box') for e in entries
-            if e.get('qty_per_box') not in (None, '')
-        }
 
 
-_FORMAT_HEADERS = ('Produktnamn', 'Produktkod', 'Mängd per låda')
+_FORMAT_HEADERS = ('Produktnamn', 'Produktkod')
 
 
 def _format_header_row(name_cell):
@@ -177,33 +173,10 @@ def _format_header_row(name_cell):
     return label in ('produktnamn', 'product_name', 'namn', 'name')
 
 
-def _parse_qty_per_box(value):
-    """Parse mängd-per-låda from an Excel cell; return float/int or None."""
-    if value is None:
-        return None
-    if isinstance(value, float) and pd.isna(value):
-        return None
-    if isinstance(value, (int, float)):
-        if float(value) == int(value):
-            return int(value)
-        return float(value)
-    text = str(value).strip().replace(',', '.')
-    if text in ('', 'nan', 'none'):
-        return None
-    try:
-        num = float(text)
-        if num == int(num):
-            return int(num)
-        return num
-    except (ValueError, TypeError):
-        return None
-
-
 def _read_format_entries_from_workbook(path):
     """Load product rows from format.xlsx without modifying the file.
 
-    Columns: A=product name (coloured), B=product code, C=mängd per låda
-    (optional; user-maintained packing size).
+    Columns: A=product name (coloured), B=product code.
     """
     if not _OPENPYXL_FORMAT:
         return []
@@ -213,10 +186,9 @@ def _read_format_entries_from_workbook(path):
     wb = load_workbook(str(path))
     ws = wb.active
     entries = []
-    for row in ws.iter_rows(min_row=1, max_col=3):
+    for row in ws.iter_rows(min_row=1, max_col=2):
         name_cell = row[0]
         code_cell = row[1] if len(row) > 1 else None
-        qty_cell = row[2] if len(row) > 2 else None
         if name_cell.value is None or str(name_cell.value).strip() == '':
             continue
         if not entries and _format_header_row(name_cell):
@@ -229,9 +201,6 @@ def _read_format_entries_from_workbook(path):
             'norm': normalize_name(name).lower(),
             'code': code,
             'color': _cell_font_color_hex(name_cell),
-            'qty_per_box': _parse_qty_per_box(
-                qty_cell.value if qty_cell is not None else None
-            ),
         })
     wb.close()
     return entries
@@ -258,16 +227,23 @@ def _unique_products_from_stock(stock_df):
 
 
 def _format_workbook_needs_upgrade(path):
-    """True if format.xlsx lacks header row and/or column C (mängd per låda)."""
+    """True if format.xlsx lacks header row or still has legacy column C."""
     path = Path(path)
     if not path.exists() or not _OPENPYXL_FORMAT:
         return True
     wb = load_workbook(str(path))
     try:
         ws = wb.active
-        if ws.max_column < 3:
+        if not _format_header_row(ws.cell(1, 1)):
             return True
-        return not _format_header_row(ws.cell(1, 1))
+        # Strip legacy "Mängd per låda" (column C) if anything remains there.
+        if ws.max_column >= 3:
+            for row in ws.iter_rows(
+                min_row=1, max_row=max(ws.max_row, 1), min_col=3, max_col=3
+            ):
+                if row[0].value not in (None, ''):
+                    return True
+        return False
     finally:
         wb.close()
 
@@ -294,22 +270,14 @@ def _write_format_workbook(path, entries, attempts=3, delay=2.0):
         name_cell = ws.cell(row=row_idx, column=1, value=entry['name'])
         code_val = entry.get('code') or None
         code_cell = ws.cell(row=row_idx, column=2, value=code_val)
-        qty_val = entry.get('qty_per_box')
-        qty_cell = ws.cell(
-            row=row_idx, column=3,
-            value=qty_val if qty_val not in (None, '') else None,
-        )
         color = entry.get('color', _FORMAT_DEFAULT_COLOR)
         name_cell.font = Font(color=_to_openpyxl_font_color(color))
         code_cell.font = Font(color=_to_openpyxl_font_color(_FORMAT_DEFAULT_COLOR))
-        qty_cell.font = Font(color=_to_openpyxl_font_color(_FORMAT_DEFAULT_COLOR))
         if border is not None:
             name_cell.border = border
             code_cell.border = border
-            qty_cell.border = border
     ws.column_dimensions['A'].width = 55
     ws.column_dimensions['B'].width = 18
-    ws.column_dimensions['C'].width = 16
 
     last_err = None
     try:
@@ -362,7 +330,6 @@ def load_and_sync_product_format(stock_df):
                 'norm': norm,
                 'code': code,
                 'color': _FORMAT_DEFAULT_COLOR,
-                'qty_per_box': None,
             })
         known_norms = {e['norm'] for e in entries}
 
@@ -374,15 +341,12 @@ def load_and_sync_product_format(stock_df):
                 'norm': norm,
                 'code': code,
                 'color': _FORMAT_DEFAULT_COLOR,
-                'qty_per_box': None,
             })
             known_norms.add(norm)
             added += 1
 
     codes_filled = 0
     for entry in entries:
-        if 'qty_per_box' not in entry:
-            entry['qty_per_box'] = None
         if not entry.get('code'):
             stock_match = stock_by_norm.get(entry['norm'])
             if stock_match and stock_match[1]:
@@ -404,8 +368,8 @@ def load_and_sync_product_format(stock_df):
                 )
             elif structure_upgrade and write_path.exists():
                 print(
-                    f"  [OK] Uppdaterade format.xlsx med kolumnrubriker "
-                    f"(Produktnamn / Produktkod / Mängd per låda)"
+                    f"  [OK] Uppdaterade format.xlsx "
+                    f"(Produktnamn / Produktkod)"
                 )
             elif not write_path.exists():
                 print(f"  [OK] Skapade format.xlsx med {len(entries)} produkter")

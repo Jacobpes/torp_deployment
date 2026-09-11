@@ -298,6 +298,15 @@ def load_stock_data(file_path):
     stock_df['stock'] = pd.to_numeric(stock_df['stock'], errors='coerce').fillna(0)
     stock_df['stock_warning_limit'] = pd.to_numeric(
         stock_df['stock_warning_limit'], errors='coerce').fillna(0)
+    if 'units_per_case' in stock_df.columns:
+        stock_df['units_per_case'] = pd.to_numeric(
+            stock_df['units_per_case'], errors='coerce'
+        )
+    else:
+        print(
+            "  [VARNING] Ingen 'units_per_case'-kolumn i stock_report – "
+            "Mängd per låda blir tom i orderlistorna"
+        )
 
     # Slå ihop duplicerade (butik, produktnamn)-rader så orderlistan inte
     # visar samma produkt flera gånger.
@@ -497,6 +506,65 @@ def _build_name_to_code_map(sales_df):
     return dict(zip(df['name'], df['product_code']))
 
 
+def _format_units_per_case(value):
+    """Visa heltal utan decimal om värdet är helt; annars float. Tomt → ''."""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ''
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return ''
+    if num == int(num):
+        return int(num)
+    return num
+
+
+def _build_units_per_case_maps(stock_df):
+    """Bygg uppslag för Mängd per låda från stock_report.units_per_case.
+
+    Returnerar (by_code, by_name) där by_code är product_code → qty och
+    by_name är normaliserat produktnamn → qty. Kod-uppslag prioriteras
+    eftersom samma produktnamn ibland har olika units_per_case per barcode.
+    """
+    by_code = {}
+    by_name = {}
+    if stock_df is None or len(stock_df) == 0:
+        return by_code, by_name
+    if 'units_per_case' not in stock_df.columns:
+        return by_code, by_name
+
+    from _common import _normalise_product_code as _norm_code
+
+    cols = ['units_per_case']
+    if 'product_code' in stock_df.columns:
+        cols.append('product_code')
+    name_col = (
+        'product_name_normalized'
+        if 'product_name_normalized' in stock_df.columns
+        else 'product_name'
+    )
+    cols.append(name_col)
+    df = stock_df[cols].copy()
+    df['units_per_case'] = pd.to_numeric(df['units_per_case'], errors='coerce')
+    df = df.dropna(subset=['units_per_case'])
+
+    if 'product_code' in df.columns:
+        for _, row in df.iterrows():
+            code = _norm_code(row.get('product_code'))
+            if code and code not in by_code:
+                by_code[code] = _format_units_per_case(row['units_per_case'])
+
+    for _, row in df.iterrows():
+        name = row.get(name_col)
+        if name is None or (isinstance(name, float) and pd.isna(name)):
+            continue
+        key = normalize_name(str(name)).lower()
+        if key and key not in by_name:
+            by_name[key] = _format_units_per_case(row['units_per_case'])
+
+    return by_code, by_name
+
+
 def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
                      bestallningsfrekvenser, latest_prices=None,
                      price_log=None, product_format=None,
@@ -514,6 +582,7 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
     price_log = price_log if price_log is not None else {'products': {}}
     kupa_kod_mapping = kupa_kod_mapping or {}
     name_to_code = _build_name_to_code_map(sales_df)
+    units_by_code, units_by_name = _build_units_per_case_maps(stock_df)
     price_changes = []
 
     supplier_products = {}
@@ -666,11 +735,11 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
             )
 
             def _qty_per_box(name):
-                if product_format is None:
-                    return ''
-                return product_format.qty_per_box_by_norm.get(
-                    normalize_name(name).lower(), ''
-                )
+                # Primär källa: stock_report.units_per_case (inte format.xlsx).
+                code = _norm_code(name_to_code.get(name))
+                if code and code in units_by_code:
+                    return units_by_code[code]
+                return units_by_name.get(normalize_name(name).lower(), '')
 
             aggregated['Mängd per låda'] = aggregated['Produktnamn'].map(_qty_per_box)
 
