@@ -212,14 +212,20 @@ def get_weekly_sales_history(product_df, store_name, product_name, weeks_back=52
 
 
 def _match_sales_product(store_sales: pd.DataFrame, product_name: str) -> str | None:
+    try:
+        from _common import names_equivalent
+    except Exception:
+        names_equivalent = None  # type: ignore[assignment]
+
     target = _normalize(product_name).lower()
     names = store_sales["name"].dropna().unique()
     for sales_name in names:
         if target == _normalize(sales_name).lower():
             return str(sales_name)
+    if names_equivalent is None:
+        return None
     for sales_name in names:
-        sn = _normalize(sales_name).lower()
-        if target in sn or sn in target:
+        if names_equivalent(product_name, sales_name):
             return str(sales_name)
     return None
 

@@ -40,6 +40,7 @@ from _common import (
     predict_product_sales,
     normalize_name,
     normalize_name_series,
+    names_equivalent,
     count_normalised_changes,
     filter_active_products,
     filter_garbage_product_names,
@@ -181,14 +182,8 @@ def product_exists_in_stock(product_name, store_name, stock_by_store):
     """Returnerar True om produkten finns i stock_report för given butik."""
     if store_name not in stock_by_store:
         return False
-    product_norm = normalize_name(product_name).lower()
     stock_names = stock_by_store[store_name]
-    if product_norm in stock_names:
-        return True
-    for stock_name in stock_names:
-        if product_norm in stock_name or stock_name in product_norm:
-            return True
-    return False
+    return any(names_equivalent(product_name, stock_name) for stock_name in stock_names)
 
 
 def filter_sales_to_stock(sales_df, stock_df):
@@ -335,10 +330,12 @@ def _match_sales_for_product(product_name_normalized, sales_by_product):
     """
     Look up the sales rows for a given normalised product name in this store.
 
-    Two-pass match (mirrors the old sales-first iteration but flipped):
+    Two-pass match:
       1. Exact normalised-lowercase name hit.
-      2. Substring fallback in either direction (handles trailing notes
-         like "Mjölkdryck 3 % Laktosfri 1 L" vs "Mjölkdryck 3% Laktosfri 1L").
+      2. Punctuation/spacing-insensitive match ("3 %" vs "3%", "1 L" vs "1L").
+
+    A shorter name must not steal a longer product's history (and the
+    reverse). "Ingefära" is not a match for "Rynkeby Ingefära Juiceshot".
 
     Returns the sales DataFrame slice or None when no sales row exists at
     all for this product+store pair (treated as predicted_sales=0).
@@ -349,8 +346,7 @@ def _match_sales_for_product(product_name_normalized, sales_by_product):
     if hit is not None:
         return hit
     for sales_name_norm, group in sales_by_product.items():
-        if (product_name_normalized in sales_name_norm
-                or sales_name_norm in product_name_normalized):
+        if names_equivalent(product_name_normalized, sales_name_norm):
             return group
     return None
 
@@ -499,6 +495,18 @@ def process_all_stores(sales_df, stock_df, parametrar, unit_mapping,
             # användarens Excel.
             store_df = _apply_picking_list_template(store_df)
 
+            # Plocklistan är en åtgärdslista: bara produkter som enligt
+            # prognosen landar under varningsgränsen. Överskott (Påfyllningsbehov
+            # <= 0) finns kvar i avancerad_plocklista, inte i butikens lista.
+            before_filter = len(store_df)
+            store_df = store_df[store_df['Påfyllningsbehov'] > 0].copy()
+            dropped = before_filter - len(store_df)
+            if dropped:
+                print(
+                    f"  Filtrerade bort {dropped} produkter som inte går under "
+                    f"varningsgränsen"
+                )
+
             safe_store_name = safe_filename(store_name)
             # CSV is internal machine data → system_data/. XLSX is what the
             # end user opens in Excel → output/.
@@ -599,6 +607,7 @@ def main():
     stock_stores = set(stock_df['store_name'].unique())
     config_stores = set(parametrar.keys())
     unknown_stores = sorted(stock_stores - config_stores)
+    configured_without_stock = sorted(config_stores - stock_stores)
     if unknown_stores:
         print(
             "\n[INFO] Följande butiker (från stock_report) saknas i "
@@ -607,15 +616,13 @@ def main():
         for s in unknown_stores:
             # repr() makes any hidden whitespace visible in the log.
             print(f"  - {s!r}")
-        configured_without_stock = sorted(config_stores - stock_stores)
-        if configured_without_stock:
-            print(
-                "  (Tips: dessa butiker finns i Leveransfrekvens.csv men "
-                "INTE i stock_report - jämför med listan ovan om "
-                "namnen råkar skilja sig åt i whitespace:)"
-            )
-            for s in configured_without_stock:
-                print(f"  - {s!r}")
+    if configured_without_stock:
+        print(
+            "\n[INFO] Följande butiker finns i Leveransfrekvens.csv men "
+            "inte i senaste stock_report (ingen plocklista skapas):"
+        )
+        for s in configured_without_stock:
+            print(f"  - {s!r}")
 
     product_format = load_and_sync_product_format(stock_df)
 
@@ -667,11 +674,8 @@ def main():
             print(f"     Excel: {advanced_xlsx}")
         print(f"     CSV:   {ADVANCED_PICKING_LIST_CSV}")
 
-        # Filtrera sammanställningen till enbart rader med faktiskt
-        # påfyllningsbehov (>0). Per-butik-filerna behåller all data
-        # (inklusive negativa värden som visar överskott), men den
-        # här sammanfattningen är en åtgärdslista - bara det som
-        # faktiskt behöver fyllas på.
+        # Samma filter som per-butik-filerna: bara rader som enligt prognosen
+        # landar under varningsgränsen. Överskott ligger i avancerad plocklista.
         results_df = results_df[results_df['Påfyllningsbehov'] > 0].copy()
         results_df = sort_dataframe_by_store_and_format(
             results_df, product_format, 'store_name', 'Produktnamn',

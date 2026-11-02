@@ -542,6 +542,32 @@ def normalize_name_series(series):
     return s.astype(object)
 
 
+def compact_name(value):
+    """
+    Lowercase name with whitespace and punctuation removed.
+
+    Used to treat "3 %" and "3%", or "1 L" and "1L", as the same product
+    without treating a short name as a match for a longer different product.
+    """
+    name = normalize_name(value)
+    if not isinstance(name, str) or not name:
+        return ''
+    return re.sub(r'[^\w]+', '', name.lower(), flags=re.UNICODE).replace('_', '')
+
+
+def names_equivalent(left, right):
+    """True when two names match exactly, or only differ by punctuation/spacing."""
+    a = normalize_name(left)
+    b = normalize_name(right)
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    if a.casefold() == b.casefold():
+        return True
+    ca = compact_name(a)
+    cb = compact_name(b)
+    return bool(ca) and ca == cb
+
+
 def count_normalised_changes(original_series, normalised_series):
     """
     Count how many cells differ between the original and the normalised

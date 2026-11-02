@@ -41,6 +41,7 @@ from _common import (
     predict_product_sales,
     normalize_name,
     normalize_name_series,
+    names_equivalent,
     count_normalised_changes,
     filter_active_products,
     filter_garbage_product_names,
@@ -341,14 +342,8 @@ def build_stock_index(stock_df):
 def product_exists_in_stock(product_name, store_name, stock_by_store):
     if store_name not in stock_by_store:
         return False
-    product_norm = normalize_name(product_name).lower()
     stock_names = stock_by_store[store_name]
-    if product_norm in stock_names:
-        return True
-    for stock_name in stock_names:
-        if product_norm in stock_name or stock_name in product_norm:
-            return True
-    return False
+    return any(names_equivalent(product_name, stock_name) for stock_name in stock_names)
 
 
 def filter_sales_to_stock(sales_df, stock_df):
@@ -394,13 +389,10 @@ def get_product_stock_info(stock_df, product_name, store_name):
     if len(matched) > 0:
         return float(matched.iloc[0]['stock']), float(matched.iloc[0]['stock_warning_limit'])
 
-    matched = stock_df[
-        (stock_df['product_name_normalized'].str.contains(
-            product_normalized, na=False, regex=False))
-        & (stock_df['store_name'] == store_normalized)
-    ]
-    if len(matched) > 0:
-        return float(matched.iloc[0]['stock']), float(matched.iloc[0]['stock_warning_limit'])
+    same_store = stock_df[stock_df['store_name'] == store_normalized]
+    for _, row in same_store.iterrows():
+        if names_equivalent(product_normalized, row.get('product_name_normalized', '')):
+            return float(row['stock']), float(row['stock_warning_limit'])
 
     return 0.0, 0.0
 
@@ -415,40 +407,63 @@ def calculate_bestallningsbehov(current_stock_total, predicted_sales_total,
     return max(0.0, bestallningsbehov)
 
 
+_SUPPLIER_SUFFIX = re.compile(r'\b(ab|oy|oyj|aboy)\b')
+
+
+def _supplier_names(name):
+    """
+    Return the base name plus any parenthetical alias.
+
+    "Metro (Wihuri)" yields {"metro", "wihuri"} so the sales-feed name
+    "Wihuri" matches the frequency row, while "Metro pikatukku" does not.
+    Company suffixes (Ab/Oy) are stripped so "Snellman Oy" matches "Snellman".
+    """
+    raw = normalize_name(name)
+    if not isinstance(raw, str) or not raw:
+        return set()
+    raw = raw.casefold()
+    aliases = [normalize_name(part).casefold() for part in re.findall(r'\(([^)]+)\)', raw)]
+    base = re.sub(r'\([^)]*\)', ' ', raw)
+    names = []
+    for part in [base, *aliases]:
+        part = _SUPPLIER_SUFFIX.sub(' ', part)
+        part = re.sub(r'\s+', ' ', part).strip()
+        if part:
+            names.append(part)
+    return set(names)
+
+
+def _supplier_is_prefix(shorter, longer):
+    """True when `shorter` is a multi-word token prefix of `longer`."""
+    short_tokens = shorter.split()
+    if len(short_tokens) < 2:
+        return False
+    long_tokens = longer.split()
+    return long_tokens[:len(short_tokens)] == short_tokens
+
+
 def match_supplier_name(supplier_from_mapping, supplier_from_frekvens):
-    """Försöker matcha leverantörsnamn mellan olika källor."""
-    if not supplier_from_mapping or not supplier_from_frekvens:
+    """
+    Match a sales-feed supplier to a Beställningsfrekvens.csv row.
+
+    Exact names, Ab/Oy suffixes, and a parenthetical alias match.
+    A multi-word name may also match a longer name that starts with it
+    ("Finn Berry" → "Finn Berry Kai Hjulfors").
+
+    A single shared word does not match. That used to put
+    "Kållby edsevö fiskargille" on Kållby honung's 28-day list and
+    "Metro pikatukku" on Metro (Wihuri)'s 21-day list.
+    """
+    left = _supplier_names(supplier_from_mapping)
+    right = _supplier_names(supplier_from_frekvens)
+    if not left or not right:
         return None
-
-    mapping_normalized = normalize_name(supplier_from_mapping).lower()
-    frekvens_normalized = normalize_name(supplier_from_frekvens).lower()
-
-    def strip_company_suffixes(name):
-        # Strip common Finnish/Swedish corporate suffixes so e.g. "Snellman"
-        # matches "Snellman Oy". Whitespace already normalised by caller, but
-        # collapse again after suffix removal in case "Foo Ab" -> "Foo  ".
-        name = re.sub(r'\b(ab|oy|ab oy|aboy)\b', '', name)
-        name = re.sub(r'\s+', ' ', name).strip()
-        return name
-
-    mapping_clean = strip_company_suffixes(mapping_normalized)
-    frekvens_clean = strip_company_suffixes(frekvens_normalized)
-
-    if mapping_clean == frekvens_clean or mapping_normalized == frekvens_normalized:
+    if left & right:
         return supplier_from_frekvens
-    if mapping_clean in frekvens_clean or frekvens_clean in mapping_clean:
-        return supplier_from_frekvens
-
-    mapping_first = mapping_clean.split()[0] if mapping_clean.split() else ''
-    frekvens_first = frekvens_clean.split()[0] if frekvens_clean.split() else ''
-    if mapping_first and frekvens_first and mapping_first == frekvens_first:
-        return supplier_from_frekvens
-
-    mapping_last = mapping_clean.split()[-1] if mapping_clean.split() else ''
-    frekvens_last = frekvens_clean.split()[-1] if frekvens_clean.split() else ''
-    if mapping_last and frekvens_last and mapping_last == frekvens_last:
-        return supplier_from_frekvens
-
+    for a in left:
+        for b in right:
+            if _supplier_is_prefix(a, b) or _supplier_is_prefix(b, a):
+                return supplier_from_frekvens
     return None
 
 
@@ -609,13 +624,14 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
     for supplier_name, products in supplier_products.items():
         try:
             order_frequency = None
+            matched_frequency_name = None
             if supplier_name in bestallningsfrekvenser:
                 order_frequency = bestallningsfrekvenser[supplier_name]
             else:
                 for frekvens_supplier, freq in bestallningsfrekvenser.items():
-                    if match_supplier_name(supplier_name, frekvens_supplier) \
-                            or match_supplier_name(frekvens_supplier, supplier_name):
+                    if match_supplier_name(supplier_name, frekvens_supplier):
                         order_frequency = freq
+                        matched_frequency_name = frekvens_supplier
                         break
 
             if order_frequency is None:
@@ -623,6 +639,12 @@ def process_suppliers(sales_df, stock_df, supplier_mapping, unit_mapping,
                 print(
                     f"\nVarning: Hittade ingen beställningsfrekvens för leverantör "
                     f"'{supplier_name}'. Använder standardvärde: {order_frequency} dagar"
+                )
+            elif matched_frequency_name is not None:
+                print(
+                    f"\nMatchade leverantör {supplier_name!r} mot "
+                    f"{matched_frequency_name!r} "
+                    f"({order_frequency} dagar)"
                 )
 
             print(

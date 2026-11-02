@@ -45,6 +45,7 @@ from _common import (
     load_sales_history,
     predict_weekly_sales,
     normalize_name,
+    names_equivalent,
     normalize_name_series,
     count_normalised_changes,
     safe_unlink,
@@ -409,9 +410,7 @@ def _build_pdf_for_store(store_name, store_products, sales_df, tmp_pdf_path):
 
             if matched_product_name is None:
                 for sales_name in product_names_in_sales:
-                    sales_normalized = normalize_name(sales_name).lower()
-                    if (product_name_normalized in sales_normalized
-                            or sales_normalized in product_name_normalized):
+                    if names_equivalent(product_name_normalized, sales_name):
                         matched_product_name = sales_name
                         break
 
