@@ -35,7 +35,11 @@ def store_allowed(user: User, store_name: str) -> bool:
     allowed = allowed_stores_for_user(user)
     if allowed is None:
         return True
-    return store_name in allowed
+    try:
+        from _common import stores_equivalent
+    except Exception:
+        return store_name in allowed
+    return any(stores_equivalent(store_name, name) for name in allowed)
 
 
 def _mtime(path: Path) -> datetime | None:
@@ -45,16 +49,31 @@ def _mtime(path: Path) -> datetime | None:
         return None
 
 
+def _display_store(label: str, known_stores: list[str]) -> str | None:
+    """Map a filename label to the current store name, including kiosk → butik."""
+    try:
+        from _common import canonical_store_name, stores_equivalent
+    except Exception:
+        canonical_store_name = lambda value: value  # type: ignore[assignment]
+        stores_equivalent = lambda left, right: left == right  # type: ignore[assignment]
+
+    stores_sorted = sorted(known_stores, key=len, reverse=True)
+    for store in stores_sorted:
+        if stores_equivalent(store, label) or _safe_filename(store) == label or store == label:
+            display = canonical_store_name(store)
+            return display if isinstance(display, str) and display else store
+    folded = label.casefold()
+    if "kiosk" in folded or folded.startswith("lager"):
+        display = canonical_store_name(label)
+        return display if isinstance(display, str) and display else label
+    return None
+
+
 def _match_store_from_plock_name(filename: str, known_stores: list[str]) -> tuple[str | None, str]:
     """Return (store_name, kind) for a plocklistor filename."""
-    # Prefer longest store name match so "Lager källby" beats shorter prefixes.
-    stores_sorted = sorted(known_stores, key=len, reverse=True)
     if filename.startswith("Plocklista_") and filename.lower().endswith(".pdf"):
         rest = filename[len("Plocklista_") : -4]
-        for store in stores_sorted:
-            if _safe_filename(store) == rest or store == rest:
-                return store, "pdf"
-        return rest or None, "pdf"
+        return _display_store(rest, known_stores) or rest or None, "pdf"
     if filename.lower().endswith(".xlsx"):
         stem = filename[:-5]
         if stem in (
@@ -63,12 +82,7 @@ def _match_store_from_plock_name(filename: str, known_stores: list[str]) -> tupl
             "Plocklistor_sammanstallning",
         ):
             return None, "other"
-        for store in stores_sorted:
-            if _safe_filename(store) == stem or store == stem:
-                return store, "xlsx"
-        # Fallback: treat stem as store name if it looks like a kiosk/lager file
-        if "kiosk" in stem.casefold() or stem.casefold().startswith("lager"):
-            return stem, "xlsx"
+        return _display_store(stem, known_stores), "xlsx"
     return None, "other"
 
 

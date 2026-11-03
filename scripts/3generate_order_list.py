@@ -41,6 +41,7 @@ from _common import (
     predict_product_sales,
     normalize_name,
     normalize_name_series,
+    canonical_store_series,
     names_equivalent,
     count_normalised_changes,
     filter_active_products,
@@ -286,7 +287,7 @@ def load_stock_data(file_path):
     # identity even with stray NBSP, ZWSP, double spaces or BOM.
     raw_store = stock_df['store_name'].astype('string')
     raw_product = stock_df['product_name'].astype('string')
-    stock_df['store_name'] = normalize_name_series(stock_df['store_name'])
+    stock_df['store_name'] = canonical_store_series(stock_df['store_name'])
     stock_df['product_name'] = normalize_name_series(stock_df['product_name'])
     changed_store = count_normalised_changes(raw_store, stock_df['store_name'])
     changed_product = count_normalised_changes(raw_product, stock_df['product_name'])

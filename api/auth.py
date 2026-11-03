@@ -74,12 +74,23 @@ def require_admin(user: Annotated[User, Depends(get_current_user)]) -> User:
     return user
 
 
+def _canonical_user_stores(user: User) -> list[str]:
+    from api.stores import canonical_store_name
+
+    seen: dict[str, str] = {}
+    for link in user.stores:
+        name = canonical_store_name(link.store_name)
+        if name:
+            seen.setdefault(name.casefold(), name)
+    return sorted(seen.values(), key=str.casefold)
+
+
 def user_to_out(user: User) -> dict:
     return {
         "id": user.id,
         "username": user.username,
         "role": user.role,
         "is_active": user.is_active,
-        "stores": sorted({s.store_name for s in user.stores}),
+        "stores": _canonical_user_stores(user),
         "created_at": user.created_at,
     }

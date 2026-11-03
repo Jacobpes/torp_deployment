@@ -79,7 +79,7 @@ function ChartsPanel() {
     <div className="stack">
       <section className="panel stack">
         <div>
-          <h1>Grafer</h1>
+          <h1>Prognoser</h1>
           <p className="muted">
             Försäljningshistorik och 4-veckors prognos – samma underlag som i
             plocklista-PDF:erna.

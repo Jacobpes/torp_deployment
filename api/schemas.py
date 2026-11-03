@@ -99,3 +99,79 @@ class ChartSeriesOut(BaseModel):
     history: list[ChartPoint]
     forecast: list[ChartPoint]
     meta: ChartMetaOut
+
+
+class AnalysisTotals(BaseModel):
+    revenue_gross: float
+    revenue_ex_vat: float
+    purchase_cost: float
+    contribution: float
+    margin_pct: float
+    quantity: float
+    lines: int
+    products: int
+    avg_price: float
+    contribution_per_unit: float
+
+
+class AnalysisPoint(BaseModel):
+    period: str
+    contribution: float
+    revenue_gross: float
+    quantity: float
+
+
+class AnalysisStoreRow(BaseModel):
+    store: str
+    contribution: float
+    revenue_gross: float
+    quantity: float
+    margin_pct: float
+    share_pct: float
+
+
+class AnalysisProductRow(BaseModel):
+    product: str
+    contribution: float
+    revenue_gross: float
+    quantity: float
+    margin_pct: float
+    share_pct: float
+    avg_price: float
+    contribution_per_unit: float
+
+
+class AnalysisSegment(BaseModel):
+    store: str
+    contribution: float
+
+
+class AnalysisStackedRow(BaseModel):
+    label: str
+    segments: list[AnalysisSegment]
+
+
+class AnalysisFocus(BaseModel):
+    product: str
+    totals: AnalysisTotals
+    by_store: list[AnalysisStoreRow]
+    series: list[AnalysisPoint]
+    stacked_series: list[AnalysisStackedRow]
+    stacked_bar: list[AnalysisStackedRow]
+
+
+class AnalysisOut(BaseModel):
+    date_from: str
+    date_to: str
+    bounds: dict[str, str]
+    bucket: Literal["day", "week", "month"]
+    store: str | None = None
+    stores: list[str]
+    assumptions: dict[str, float]
+    totals: AnalysisTotals
+    series: list[AnalysisPoint]
+    by_store: list[AnalysisStoreRow]
+    products: list[AnalysisProductRow]
+    stacked_products: list[AnalysisStackedRow]
+    stacked_series: list[AnalysisStackedRow]
+    focus: AnalysisFocus | None = None

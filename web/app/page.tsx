@@ -17,8 +17,11 @@ export default function HomePage() {
             </p>
           </div>
           <div className="row">
-            <Link className="btn accent" href="/charts">
-              Visa grafer
+            <Link className="btn accent" href="/analysis">
+              Analysverktyg
+            </Link>
+            <Link className="btn" href="/charts">
+              Prognoser
             </Link>
             <Link className="btn" href="/downloads">
               Öppna filer

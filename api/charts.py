@@ -67,26 +67,52 @@ def get_sales_df() -> pd.DataFrame:
 def list_chart_stores(user: User) -> list[str]:
     if not SYSTEM_PLOCK_DIR.exists():
         return []
+    from _common import canonical_store_name
+
     stores: list[str] = []
+    seen: set[str] = set()
     skip = {"picking_list_results.csv", "avancerad_plocklista.csv"}
     for path in sorted(SYSTEM_PLOCK_DIR.glob("*.csv")):
         if path.name in skip:
             continue
-        store = path.stem
-        if store_allowed(user, store):
-            stores.append(store)
+        store = canonical_store_name(path.stem)
+        if not isinstance(store, str) or not store:
+            continue
+        key = store.casefold()
+        if key in seen or not store_allowed(user, store):
+            continue
+        seen.add(key)
+        stores.append(store)
     return stores
 
 
+def _store_file_aliases(store: str) -> list[str]:
+    """Filenames to try: current butik name and the old kiosk name."""
+    from _common import canonical_store_name
+
+    canon = canonical_store_name(store)
+    names: list[str] = []
+    for name in (canon, store):
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    if isinstance(canon, str) and canon.casefold().endswith(" butik"):
+        kiosk = canon[: -len("butik")] + "kiosk"
+        if kiosk not in names:
+            names.append(kiosk)
+    return names
+
+
 def _picking_csv_for_store(store: str) -> Path | None:
-    path = SYSTEM_PLOCK_DIR / f"{store}.csv"
-    if path.is_file():
-        return path
-    # Fallback: case-insensitive match
+    for name in _store_file_aliases(store):
+        path = SYSTEM_PLOCK_DIR / f"{name}.csv"
+        if path.is_file():
+            return path
+    # Fallback: case-insensitive match against either name
     if not SYSTEM_PLOCK_DIR.exists():
         return None
+    wanted = {name.casefold() for name in _store_file_aliases(store)}
     for candidate in SYSTEM_PLOCK_DIR.glob("*.csv"):
-        if candidate.stem.casefold() == store.casefold():
+        if candidate.stem.casefold() in wanted:
             return candidate
     return None
 
@@ -266,14 +292,23 @@ def build_chart(store: str, product: str) -> dict:
         }
 
     sales_df = get_sales_df()
-    store_sales = sales_df[sales_df["store"] == store] if len(sales_df) else sales_df
-    # Also try normalized store match
-    if len(store_sales) == 0 and len(sales_df):
-        target = _normalize(store).lower()
-        mask = sales_df["store"].map(lambda s: _normalize(s).lower() == target)
-        store_sales = sales_df[mask]
+    from _common import canonical_store_name
+
+    requested = canonical_store_name(store)
+    if not isinstance(requested, str) or not requested:
+        requested = store
+    if len(sales_df):
+        target = requested.casefold()
+        canon = sales_df["store"].map(canonical_store_name).astype("string")
+        store_sales = sales_df[canon.str.casefold() == target]
         if len(store_sales):
             store = str(store_sales["store"].iloc[0])
+        else:
+            store = requested
+            store_sales = sales_df.iloc[0:0]
+    else:
+        store = requested
+        store_sales = sales_df
 
     matched = _match_sales_product(store_sales, product) if len(store_sales) else None
     history = pd.DataFrame(

@@ -542,6 +542,43 @@ def normalize_name_series(series):
     return s.astype(object)
 
 
+# Stores were renamed from "kiosk" to "butik" (Bosund kiosk → Bosund butik).
+# A trailing kiosk token is the old name of the same store. Names that do
+# not end in kiosk, such as "Bosund GAMLA STÄNGD" or "Lager kållby", stay
+# as they are.
+_STORE_KIOSK_SUFFIX = re.compile(r'(?i)\bkiosk$')
+
+
+def canonical_store_name(value):
+    """
+    Return the current store name.
+
+    'Bosund kiosk' and 'Bosund butik' are the same store. The form ending
+    in 'butik' is the one used in current reports.
+    """
+    name = normalize_name(value)
+    if not isinstance(name, str) or not name:
+        return name
+    if _STORE_KIOSK_SUFFIX.search(name):
+        return _STORE_KIOSK_SUFFIX.sub('butik', name)
+    return name
+
+
+def canonical_store_series(series):
+    """Vectorised canonical_store_name. NaN is preserved."""
+    s = normalize_name_series(series).astype('string')
+    return s.str.replace(_STORE_KIOSK_SUFFIX, 'butik', regex=True)
+
+
+def stores_equivalent(left, right):
+    """True when two store labels are the same store, including kiosk/butik."""
+    a = canonical_store_name(left)
+    b = canonical_store_name(right)
+    if not isinstance(a, str) or not isinstance(b, str) or not a or not b:
+        return False
+    return a.casefold() == b.casefold()
+
+
 def compact_name(value):
     """
     Lowercase name with whitespace and punctuation removed.
@@ -1462,9 +1499,9 @@ def load_leveransfrekvens(file_path):
             butik_raw = row[store_col]
             if not pd.notna(butik_raw):
                 continue
-            # normalize_name (not just .strip()) so a stray NBSP or double
-            # space in the CSV resolves to the same key as the sales data.
-            butik = normalize_name(butik_raw)
+            # 'Bosund kiosk' in this file is the same store as 'Bosund butik'
+            # in the current stock and sales exports.
+            butik = canonical_store_name(butik_raw)
             if not butik:
                 continue
             try:
@@ -1583,12 +1620,11 @@ def _prepare_sales_df(df, keep_unit=False):
     if before != len(df):
         print(f"  Removed {before - len(df)} rows with missing product name or store")
 
-    # Normalise whitespace in name/store columns so that small differences
-    # in CSV exports (trailing space, NBSP, double space, BOM) don't cause
-    # "Sandsund kiosk" and "Sandsund kiosk " to be treated as separate stores.
+    # Collapse whitespace and rename a trailing "kiosk" to "butik", so
+    # "Sandsund kiosk" and "Sandsund butik" are the same store.
     raw_store = df['store'].astype('string')
     raw_name = df['name'].astype('string')
-    df['store'] = normalize_name_series(df['store'])
+    df['store'] = canonical_store_series(df['store'])
     df['name'] = normalize_name_series(df['name'])
 
     store_changed = count_normalised_changes(raw_store, df['store'])

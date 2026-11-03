@@ -16,11 +16,17 @@ if str(_SCRIPTS) not in sys.path:
 
 def _normalize(name: str) -> str:
     try:
-        from _common import normalize_name
+        from _common import canonical_store_name
 
-        return normalize_name(str(name))
+        value = canonical_store_name(str(name))
+        return value if isinstance(value, str) else " ".join(str(name).split())
     except Exception:
         return " ".join(str(name).split())
+
+
+def canonical_store_name(name: str) -> str:
+    """Current store name. 'Bosund kiosk' and 'Bosund butik' are the same."""
+    return _normalize(name)
 
 
 def discover_stores() -> list[str]:

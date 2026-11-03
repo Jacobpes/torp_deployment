@@ -47,6 +47,7 @@ from _common import (
     normalize_name,
     names_equivalent,
     normalize_name_series,
+    canonical_store_series,
     count_normalised_changes,
     safe_unlink,
     load_product_format,
@@ -612,7 +613,7 @@ def main():
     # whitespace from Excel) doesn't silently fragment a store into duplicates.
     raw_store = picking_list_df['store_name'].astype('string')
     raw_product = picking_list_df['Produktnamn'].astype('string')
-    picking_list_df['store_name'] = normalize_name_series(picking_list_df['store_name'])
+    picking_list_df['store_name'] = canonical_store_series(picking_list_df['store_name'])
     picking_list_df['Produktnamn'] = normalize_name_series(picking_list_df['Produktnamn'])
     changed_store = count_normalised_changes(raw_store, picking_list_df['store_name'])
     changed_product = count_normalised_changes(raw_product, picking_list_df['Produktnamn'])

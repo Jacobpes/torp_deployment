@@ -19,11 +19,13 @@ from api.auth import (
     user_to_out,
     verify_password,
 )
+from api.analysis import build_analysis
 from api.charts import build_chart, list_chart_stores, list_products_for_store
 from api.database import get_db
 from api.files import list_files_for_user, resolve_download, store_allowed
 from api.models import User, UserStore
 from api.schemas import (
+    AnalysisOut,
     ChartProductOut,
     ChartSeriesOut,
     CreateUserRequest,
@@ -41,6 +43,7 @@ auth_router = APIRouter(prefix="/api/auth", tags=["auth"])
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
 files_router = APIRouter(prefix="/api/files", tags=["files"])
 charts_router = APIRouter(prefix="/api/charts", tags=["charts"])
+analysis_router = APIRouter(prefix="/api/analysis", tags=["analysis"])
 
 
 @auth_router.post("/login", response_model=UserOut)
@@ -229,3 +232,29 @@ def chart_series(
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chart failed: {e}") from e
+
+
+@analysis_router.get("", response_model=AnalysisOut)
+def analysis(
+    user: Annotated[User, Depends(get_current_user)],
+    date_from: str | None = None,
+    date_to: str | None = None,
+    store: str | None = None,
+    product: str | None = None,
+):
+    try:
+        return build_analysis(
+            user,
+            date_from=date_from,
+            date_to=date_to,
+            store=store,
+            product=product,
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysen misslyckades: {e}") from e

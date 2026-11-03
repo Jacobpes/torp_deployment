@@ -40,6 +40,8 @@ from _common import (
     predict_product_sales,
     normalize_name,
     normalize_name_series,
+    canonical_store_name,
+    canonical_store_series,
     names_equivalent,
     count_normalised_changes,
     filter_active_products,
@@ -130,7 +132,7 @@ def load_stock_data(file_path):
     # identity even if one source has a stray NBSP, double space or BOM.
     raw_store = stock_df['store_name'].astype('string')
     raw_product = stock_df['product_name'].astype('string')
-    stock_df['store_name'] = normalize_name_series(stock_df['store_name'])
+    stock_df['store_name'] = canonical_store_series(stock_df['store_name'])
     stock_df['product_name'] = normalize_name_series(stock_df['product_name'])
     changed_store = count_normalised_changes(raw_store, stock_df['store_name'])
     changed_product = count_normalised_changes(raw_product, stock_df['product_name'])
@@ -255,7 +257,7 @@ def load_unit_mapping(file_path):
             continue
         # normalize_name handles NBSP, ZWSP, double spaces - not just .strip().
         product_name = normalize_name(row['product_name'])
-        store_name = normalize_name(row.get('store_name', ''))
+        store_name = canonical_store_name(row.get('store_name', ''))
         if not product_name:
             continue
         key = (product_name.lower(), store_name)

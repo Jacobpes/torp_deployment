@@ -12,7 +12,7 @@ from api.auth import hash_password
 from api.config import ADMIN_PASSWORD, ADMIN_USER, CORS_ORIGINS
 from api.database import SessionLocal, init_db
 from api.models import User
-from api.routers import admin_router, auth_router, charts_router, files_router
+from api.routers import admin_router, analysis_router, auth_router, charts_router, files_router
 
 
 def bootstrap_admin() -> None:
@@ -53,6 +53,7 @@ app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(files_router)
 app.include_router(charts_router)
+app.include_router(analysis_router)
 
 
 @app.get("/api/health")

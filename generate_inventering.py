@@ -26,8 +26,8 @@ sales_df['product_name'] = sales_df['product_name'].apply(clean_product_name)
 stock_clean = stock_df.groupby('product_name')['stock'].sum().reset_index()
 stock_clean.columns = ['product_name', 'saldo']
 
-# Beräkna genomsnittligt pris per produkt från sales (använd line_total)
-sales_df['inköpspris'] = sales_df['line_total'] / 1.14 / 1.25
+# Kundpris inkl. 25 % moms. Marginalen är 25 % av priset exkl. moms.
+sales_df['inköpspris'] = sales_df['line_total'] / 1.25 * 0.75
 
 # Gruppera per produktnamn och beräkna genomsnittligt inköpspris samt hämta enhet
 sales_prices = sales_df.groupby('product_name').agg({

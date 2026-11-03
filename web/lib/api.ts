@@ -50,6 +50,77 @@ export type ChartSeries = {
   };
 };
 
+export type AnalysisTotals = {
+  revenue_gross: number;
+  revenue_ex_vat: number;
+  purchase_cost: number;
+  contribution: number;
+  margin_pct: number;
+  quantity: number;
+  lines: number;
+  products: number;
+  avg_price: number;
+  contribution_per_unit: number;
+};
+
+export type AnalysisPoint = {
+  period: string;
+  contribution: number;
+  revenue_gross: number;
+  quantity: number;
+};
+
+export type AnalysisStoreRow = {
+  store: string;
+  contribution: number;
+  revenue_gross: number;
+  quantity: number;
+  margin_pct: number;
+  share_pct: number;
+};
+
+export type AnalysisProductRow = {
+  product: string;
+  contribution: number;
+  revenue_gross: number;
+  quantity: number;
+  margin_pct: number;
+  share_pct: number;
+  avg_price: number;
+  contribution_per_unit: number;
+};
+
+export type AnalysisStackedRow = {
+  label: string;
+  segments: { store: string; contribution: number }[];
+};
+
+export type AnalysisFocus = {
+  product: string;
+  totals: AnalysisTotals;
+  by_store: AnalysisStoreRow[];
+  series: AnalysisPoint[];
+  stacked_series: AnalysisStackedRow[];
+  stacked_bar: AnalysisStackedRow[];
+};
+
+export type AnalysisReport = {
+  date_from: string;
+  date_to: string;
+  bounds: { min_date: string; max_date: string };
+  bucket: "day" | "week" | "month";
+  store: string | null;
+  stores: string[];
+  assumptions: { vat_factor: number; markup_factor: number; margin_pct: number };
+  totals: AnalysisTotals;
+  series: AnalysisPoint[];
+  by_store: AnalysisStoreRow[];
+  products: AnalysisProductRow[];
+  stacked_products: AnalysisStackedRow[];
+  stacked_series: AnalysisStackedRow[];
+  focus: AnalysisFocus | null;
+};
+
 export type JobStatus = {
   running: boolean;
   pid?: number | null;
@@ -96,6 +167,26 @@ export async function api<T>(
 
 export function downloadUrl(path: string): string {
   return `/api/files/download?path=${encodeURIComponent(path)}`;
+}
+
+const euroFormat = new Intl.NumberFormat("sv-SE", {
+  style: "currency",
+  currency: "EUR",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+const numberFormat = new Intl.NumberFormat("sv-SE", {
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 2,
+});
+
+export function formatEuro(value: number): string {
+  return euroFormat.format(value);
+}
+
+export function formatNumber(value: number): string {
+  return numberFormat.format(value);
 }
 
 export function formatBytes(n: number): string {
