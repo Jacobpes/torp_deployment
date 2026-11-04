@@ -195,6 +195,18 @@ def run_script(script_path, description):
             
             main_logger.info(f"\n[OK] Successfully completed: {description}")
             return True
+        except SystemExit as e:
+            # Scripts used to call sys.exit() on download errors. That is a
+            # BaseException, so it skipped this handler and killed the exe
+            # before any lists were written. Treat it as a failed step.
+            code = e.code if isinstance(e.code, int) else 1
+            if code == 0:
+                main_logger.info(f"\n[OK] Successfully completed: {description}")
+                return True
+            error_msg = f"\n[ERROR] Error running {description}: script exited with code {code}"
+            main_logger.error(error_msg)
+            error_logger.error(error_msg)
+            return False
         except Exception as e:
             error_msg = f"\n[ERROR] Error running {description}: {e}"
             main_logger.error(error_msg)
@@ -307,15 +319,28 @@ def main():
         main_logger.warning(warning_msg)
         error_logger.warning(warning_msg)
 
-    # Fail fast if Torp Excel files are still locked after the close attempt.
+    # Close anything still holding format.xlsx / output workbooks, then
+    # continue. A single locked file used to abort the whole run, so the
+    # customer got no lists at all.
     try:
-        preflight_torp_excel_files(script_dir)
+        still_locked = preflight_torp_excel_files(script_dir) or []
+    except Exception as e:
+        still_locked = []
+        warning_msg = (
+            f"\nWARNING: Kunde inte kontrollera om Excel-filer är öppna: {e}\n"
+            f"Fortsätter med listgenerering.\n"
+        )
+        main_logger.warning(warning_msg)
+        error_logger.warning(warning_msg)
+    if still_locked:
+        warning_msg = (
+            f"\nWARNING: {len(still_locked)} Excel-fil(er) är fortfarande öppna "
+            f"efter stängningsförsök. Körningen fortsätter; låsta listor hoppas över.\n"
+        )
+        main_logger.warning(warning_msg)
+        error_logger.warning(warning_msg)
+    else:
         main_logger.info("Excel-filer (format.xlsx / output) är inte låsta – fortsätter.")
-    except PermissionError as e:
-        error_msg = f"\n{e}"
-        main_logger.error(error_msg)
-        error_logger.error(error_msg)
-        return False
     
     # Step 3: Generate picking list
     print_header("STEP 3: Generating picking list")
@@ -391,6 +416,9 @@ if __name__ == "__main__":
         main_logger.error(error_msg)
         error_logger.error(error_msg)
         flush_and_exit(1)
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 1
+        flush_and_exit(code)
     except Exception as e:
         error_msg = f"\n\nFATAL ERROR: {e}"
         main_logger.error(error_msg)

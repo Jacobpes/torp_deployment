@@ -15,6 +15,7 @@ This module centralises code that was previously duplicated across
     weekly-forecast helpers used by the graphical picking list)
 """
 
+import gc
 import os
 import re
 import sys
@@ -39,6 +40,26 @@ except ImportError:
     _ADVANCED_ML = False
 
 warnings.filterwarnings('ignore')
+
+
+def _raise_windows_open_file_limit(limit=2048):
+    """Lift Windows' default CRT cap of 512 simultaneous open files.
+
+    One workbook per store/supplier, on top of the SFTP download, is enough
+    to hit that cap ("Too many open files" / "för många öppna filer") and
+    abort the run before lists are written. 2048 is the highest value
+    _setmaxstdio accepts.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        import ctypes
+        ctypes.windll.msvcrt._setmaxstdio(int(limit))
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+_raise_windows_open_file_limit()
 
 
 # ---------------------------------------------------------------------------
@@ -184,26 +205,28 @@ def _read_format_entries_from_workbook(path):
     if not path.exists():
         return []
     wb = load_workbook(str(path))
-    ws = wb.active
-    entries = []
-    for row in ws.iter_rows(min_row=1, max_col=2):
-        name_cell = row[0]
-        code_cell = row[1] if len(row) > 1 else None
-        if name_cell.value is None or str(name_cell.value).strip() == '':
-            continue
-        if not entries and _format_header_row(name_cell):
-            continue
-        name = str(name_cell.value).strip()
-        code_raw = code_cell.value if code_cell is not None else ''
-        code = _normalise_product_code(code_raw) if code_raw not in (None, '') else ''
-        entries.append({
-            'name': name,
-            'norm': normalize_name(name).lower(),
-            'code': code,
-            'color': _cell_font_color_hex(name_cell),
-        })
-    wb.close()
-    return entries
+    try:
+        ws = wb.active
+        entries = []
+        for row in ws.iter_rows(min_row=1, max_col=2):
+            name_cell = row[0]
+            code_cell = row[1] if len(row) > 1 else None
+            if name_cell.value is None or str(name_cell.value).strip() == '':
+                continue
+            if not entries and _format_header_row(name_cell):
+                continue
+            name = str(name_cell.value).strip()
+            code_raw = code_cell.value if code_cell is not None else ''
+            code = _normalise_product_code(code_raw) if code_raw not in (None, '') else ''
+            entries.append({
+                'name': name,
+                'norm': normalize_name(name).lower(),
+                'code': code,
+                'color': _cell_font_color_hex(name_cell),
+            })
+        return entries
+    finally:
+        wb.close()
 
 
 def _unique_products_from_stock(stock_df):
@@ -456,6 +479,10 @@ def write_formatted_excel(df, excel_path, sheet_name, product_format,
                     bold=cell.font.bold,
                     italic=cell.font.italic,
                 )
+    # openpyxl workbooks keep the xlsx zip open across a reference cycle, so
+    # the handle is not released until a cyclic GC. One file per supplier is
+    # enough to exhaust Windows' open-file cap if we wait for that.
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -1347,14 +1374,326 @@ def preflight_file_not_locked(path):
         reraise_if_write_locked(path, e)
 
 
-def preflight_torp_excel_files(project_root=None):
+def _subprocess_no_window_kwargs():
+    """Hide the console window taskkill/tasklist would otherwise flash."""
+    if sys.platform != 'win32':
+        return {}
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    return {'creationflags': flags} if flags else {}
+
+
+def _excel_still_running():
+    """True when an EXCEL.EXE process is visible to this user."""
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq EXCEL.EXE', '/NH'],
+            capture_output=True,
+            text=True,
+            check=False,
+            **_subprocess_no_window_kwargs(),
+        )
+    except OSError:
+        return False
+    return 'EXCEL.EXE' in ((result.stdout or '') + (result.stderr or '')).upper()
+
+
+def close_all_excel_applications():
     """
-    Fail fast when Torp Excel files the pipeline may overwrite are locked.
+    Stäng alla Excel-processer på Windows så att låsta .xlsx/.csv kan
+    skrivas om. Osparade ändringar i öppna arbetsböcker går förlorade.
+
+    Excel stängs med taskkill, inte via COM. En modal dialogruta i Excel
+    ("för många filer är öppna", spara-fråga, m.m.) blockerar COM för alltid,
+    och då kördes aldrig force-kill — pipelinen dog utan att skriva listor.
+    """
+    if sys.platform != 'win32':
+        print("  [INFO] Hoppar över Excel-stängning (inte Windows).")
+        return
+
+    killed_any = False
+    warned = False
+    deadline = time.time() + 12.0
+    while True:
+        if not _excel_still_running():
+            if killed_any:
+                print("  [OK] Stängde Excel.")
+            else:
+                print("  [OK] Ingen Excel-process körde.")
+            break
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/T', '/IM', 'EXCEL.EXE'],
+                capture_output=True,
+                text=True,
+                check=False,
+                **_subprocess_no_window_kwargs(),
+            )
+        except OSError as e:
+            print(f"  [VARNING] Kunde inte köra taskkill för Excel: {e}")
+            break
+        # 0 = killed something, 128 = process not found (already closed).
+        if result.returncode == 0:
+            killed_any = True
+        elif result.returncode != 128 and not warned:
+            warned = True
+            stderr = (result.stderr or result.stdout or '').strip()
+            if stderr:
+                print(f"  [VARNING] taskkill Excel: {stderr}")
+        if time.time() >= deadline:
+            if _excel_still_running():
+                print(
+                    "  [VARNING] Excel kör fortfarande. Kör programmet som samma "
+                    "användare som har filerna öppna, eller som administratör."
+                )
+            break
+        time.sleep(0.5)
+
+    # Windows släpper filhandtag en stund efter att processen dött,
+    # särskilt när många arbetsböcker var öppna.
+    if killed_any:
+        time.sleep(1.0)
+
+
+# Only these processes are force-closed when they hold output/download files.
+# Explorer, antivirus and Office preview stay up; we only report them.
+_KILLABLE_LOCK_EXES = {'excel.exe', 'torp_report_generator.exe'}
+
+
+def _process_exe_name(pid):
+    """Image file name for `pid`, or '' if this process cannot query it."""
+    if sys.platform != 'win32' or not pid:
+        return ''
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return ''
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return Path(buf.value).name
+        return ''
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _locking_processes(paths):
+    """
+    Return [(pid, app_name), ...] for processes that have any of `paths` open.
+
+    Uses the Windows Restart Manager. Returns [] on non-Windows or if the
+    API is unavailable. Does not terminate anything.
+    """
+    if sys.platform != 'win32':
+        return []
+    existing = []
+    seen_paths = set()
+    for path in paths:
+        resolved = Path(path).resolve()
+        if resolved in seen_paths or not resolved.exists():
+            continue
+        seen_paths.add(resolved)
+        existing.append(str(resolved))
+    if not existing:
+        return []
+
+    import ctypes
+    from ctypes import wintypes
+
+    ERROR_MORE_DATA = 234
+    rstrtmgr = ctypes.WinDLL('Rstrtmgr', use_last_error=True)
+
+    class RM_UNIQUE_PROCESS(ctypes.Structure):
+        _fields_ = [
+            ('dwProcessId', wintypes.DWORD),
+            ('ProcessStartTime', wintypes.FILETIME),
+        ]
+
+    class RM_PROCESS_INFO(ctypes.Structure):
+        _fields_ = [
+            ('Process', RM_UNIQUE_PROCESS),
+            ('strAppName', wintypes.WCHAR * (255 + 1)),
+            ('strServiceShortName', wintypes.WCHAR * (63 + 1)),
+            ('ApplicationType', wintypes.DWORD),
+            ('AppStatus', wintypes.ULONG),
+            ('TSSessionId', wintypes.DWORD),
+            ('bRestartable', wintypes.BOOL),
+        ]
+
+    rstrtmgr.RmStartSession.argtypes = [
+        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, wintypes.LPWSTR,
+    ]
+    rstrtmgr.RmStartSession.restype = wintypes.DWORD
+    rstrtmgr.RmRegisterResources.argtypes = [
+        wintypes.DWORD,
+        wintypes.UINT,
+        ctypes.POINTER(wintypes.LPCWSTR),
+        wintypes.UINT,
+        ctypes.c_void_p,
+        wintypes.UINT,
+        ctypes.c_void_p,
+    ]
+    rstrtmgr.RmRegisterResources.restype = wintypes.DWORD
+    rstrtmgr.RmGetList.argtypes = [
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.UINT),
+        ctypes.POINTER(wintypes.UINT),
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    rstrtmgr.RmGetList.restype = wintypes.DWORD
+    rstrtmgr.RmEndSession.argtypes = [wintypes.DWORD]
+    rstrtmgr.RmEndSession.restype = wintypes.DWORD
+
+    found = []
+    seen_pids = set()
+    # Restart Manager accepts a modest file list per session.
+    for start in range(0, len(existing), 64):
+        batch = existing[start:start + 64]
+        session = wintypes.DWORD()
+        key = ctypes.create_unicode_buffer(33)
+        if rstrtmgr.RmStartSession(ctypes.byref(session), 0, key) != 0:
+            continue
+        try:
+            arr = (wintypes.LPCWSTR * len(batch))()
+            for i, name in enumerate(batch):
+                arr[i] = name
+            if rstrtmgr.RmRegisterResources(
+                session, len(batch), arr, 0, None, 0, None
+            ) != 0:
+                continue
+            needed = wintypes.UINT(0)
+            count = wintypes.UINT(0)
+            reason = wintypes.DWORD()
+            res = rstrtmgr.RmGetList(
+                session, ctypes.byref(needed), ctypes.byref(count), None,
+                ctypes.byref(reason),
+            )
+            if res == 0 or needed.value == 0:
+                continue
+            if res not in (0, ERROR_MORE_DATA):
+                continue
+            count = wintypes.UINT(needed.value)
+            info = (RM_PROCESS_INFO * count.value)()
+            res = rstrtmgr.RmGetList(
+                session, ctypes.byref(needed), ctypes.byref(count), info,
+                ctypes.byref(reason),
+            )
+            if res != 0:
+                continue
+            for i in range(count.value):
+                pid = int(info[i].Process.dwProcessId)
+                if pid <= 4 or pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                found.append((pid, str(info[i].strAppName or '')))
+        finally:
+            rstrtmgr.RmEndSession(session)
+    return found
+
+
+def _should_terminate_locker(pid, exe_name, app_name):
+    """True for Excel and a previous report-generator exe. Never ourselves."""
+    if not pid or int(pid) in (os.getpid(), os.getppid()):
+        return False
+    exe = (exe_name or '').lower()
+    if exe in _KILLABLE_LOCK_EXES:
+        return True
+    # OpenProcess can fail across sessions; the friendly name is the fallback.
+    if not exe and 'excel' in (app_name or '').lower():
+        return True
+    return False
+
+
+def release_locks_on_paths(paths):
+    """
+    Close processes that hold `paths` open, when they are Excel or another
+    torp_report_generator.exe. Other lockers (Explorer preview, antivirus)
+    are logged and left alone.
+    """
+    if sys.platform != 'win32':
+        return
+    try:
+        holders = _locking_processes(paths)
+    except OSError as e:
+        print(f"  [VARNING] Kunde inte se vilken process som håller filer öppna: {e}")
+        return
+    seen = set()
+    for pid, app_name in holders:
+        if pid in seen:
+            continue
+        seen.add(pid)
+        exe = _process_exe_name(pid)
+        label = exe or app_name or str(pid)
+        if not _should_terminate_locker(pid, exe, app_name):
+            print(
+                f"  [VARNING] {label} (pid {pid}) har filer öppna men stängs "
+                f"inte automatiskt."
+            )
+            continue
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/T', '/PID', str(pid)],
+                capture_output=True,
+                text=True,
+                check=False,
+                **_subprocess_no_window_kwargs(),
+            )
+        except OSError as e:
+            print(f"  [VARNING] Kunde inte stänga {label} (pid {pid}): {e}")
+            continue
+        if result.returncode == 0:
+            print(f"  [OK] Stängde {label} (pid {pid}) som höll filer öppna.")
+        else:
+            err = (result.stderr or result.stdout or '').strip()
+            print(f"  [VARNING] Kunde inte stänga {label} (pid {pid}): {err}")
+
+
+def _locked_paths(paths):
+    """Paths that exist and cannot be opened for writing (sharing violation)."""
+    locked = []
+    seen = set()
+    for path in paths:
+        resolved = Path(path).resolve()
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        try:
+            preflight_file_not_locked(resolved)
+        except PermissionError:
+            locked.append(resolved)
+        except OSError as e:
+            print(f"  [VARNING] Kunde inte kontrollera {resolved.name}: {e}")
+            locked.append(resolved)
+    return locked
+
+
+def preflight_torp_excel_files(project_root=None, try_unlock=True):
+    """
+    Make sure format.xlsx and existing output workbooks can be overwritten.
 
     Checks format.xlsx and any existing .xlsx under output/plocklistor,
-    output/orderlistor and output/orderlistor_leverantor. Raises
-    PermissionError with a list of locked paths so the user can close Excel
-    and re-run instead of failing mid-pipeline.
+    output/orderlistor and output/orderlistor_leverantor. Open files are
+    closed automatically (Excel, and a previous report-generator exe).
+
+    Returns the list of paths that are still locked. Does not abort the run:
+    one open workbook used to stop every list from being written.
     """
     root = Path(project_root) if project_root is not None else get_project_root()
     candidates = [root / 'data' / 'parametrar' / 'format.xlsx']
@@ -1367,91 +1706,37 @@ def preflight_torp_excel_files(project_root=None):
         if folder.is_dir():
             candidates.extend(sorted(folder.glob('*.xlsx')))
 
-    seen = set()
-    locked = []
-    for path in candidates:
-        resolved = Path(path).resolve()
-        if resolved in seen or not resolved.exists():
-            continue
-        seen.add(resolved)
+    locked = _locked_paths(candidates)
+    if not locked:
+        return []
+
+    if try_unlock and sys.platform == 'win32':
+        print(
+            f"  [INFO] {len(locked)} Excel-fil(er) är öppna. "
+            f"Stänger dem automatiskt..."
+        )
         try:
-            preflight_file_not_locked(resolved)
-        except PermissionError:
-            locked.append(resolved)
+            close_all_excel_applications()
+            release_locks_on_paths(locked)
+        except Exception as e:
+            print(f"  [VARNING] Kunde inte stänga öppna filer automatiskt: {e}")
+        for _ in range(8):
+            time.sleep(0.5)
+            locked = _locked_paths(locked)
+            if not locked:
+                print("  [OK] Öppna Excel-filer är stängda.")
+                return []
 
     if not locked:
-        return
+        return []
 
-    lines = [
-        'AVBRYTER: Följande Excel-filer är låsta (stäng dem i Excel och kör om):',
-    ]
-    lines.extend(f'  - {p}' for p in locked)
-    raise PermissionError('\n'.join(lines))
-
-
-def close_all_excel_applications():
-    """
-    Stäng alla Excel-processer på Windows så att låsta .xlsx-filer kan
-    skrivas om. Osparade ändringar i öppna arbetsböcker går förlorade.
-
-    Ordning:
-      1. Försök stänga snyggt via COM (win32com) om Excel svarar.
-      2. Force-kill EXCEL.EXE via taskkill som fallback.
-    """
-    if sys.platform != 'win32':
-        print("  [INFO] Hoppar över Excel-stängning (inte Windows).")
-        return
-
-    closed_via_com = False
-    try:
-        import win32com.client  # type: ignore
-
-        try:
-            excel = win32com.client.GetActiveObject('Excel.Application')
-        except Exception:
-            excel = None
-        if excel is not None:
-            try:
-                excel.DisplayAlerts = False
-                # Workbooks-collection shrinks as we close; iterate a snapshot.
-                count = int(excel.Workbooks.Count)
-                for i in range(count, 0, -1):
-                    try:
-                        excel.Workbooks(i).Close(SaveChanges=False)
-                    except Exception:
-                        pass
-                excel.Quit()
-                closed_via_com = True
-                print(f"  [OK] Stängde Excel via COM ({count} arbetsbok(er)).")
-            except Exception as e:
-                print(f"  [VARNING] COM-stängning av Excel misslyckades: {e}")
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"  [VARNING] Kunde inte anropa Excel via COM: {e}")
-
-    try:
-        result = subprocess.run(
-            ['taskkill', '/F', '/IM', 'EXCEL.EXE'],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        # 0 = killed something, 128 = process not found (already closed).
-        if result.returncode == 0:
-            print("  [OK] Force-stängde kvarvarande EXCEL.EXE-process(er).")
-        elif result.returncode == 128:
-            if not closed_via_com:
-                print("  [OK] Ingen Excel-process körde.")
-        else:
-            stderr = (result.stderr or '').strip()
-            if stderr:
-                print(f"  [VARNING] taskkill Excel: {stderr}")
-    except OSError as e:
-        print(f"  [VARNING] Kunde inte köra taskkill för Excel: {e}")
-
-    # Ge Windows en kort stund att släppa filhandtag.
-    time.sleep(1.0)
+    print(
+        "  [VARNING] Följande filer är fortfarande öppna. Körningen fortsätter "
+        "och skriver alla listor som går att skriva:"
+    )
+    for path in locked:
+        print(f"    - {path}")
+    return locked
 
 
 # ---------------------------------------------------------------------------
